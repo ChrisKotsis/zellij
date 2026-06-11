@@ -98,6 +98,10 @@ pub struct ConnectionTable {
     // web_client_id -> session name it attached to, so "detach other clients"
     // can be scoped to the requester's session.
     pub client_id_to_session: HashMap<String, String>,
+    // session name -> web_client_id that owns the session size. While an owner
+    // is set, TerminalResize from any OTHER client of that session is dropped,
+    // so they mirror the owner's size and can never re-clamp it.
+    pub session_size_owner: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]

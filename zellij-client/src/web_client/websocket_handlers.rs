@@ -62,21 +62,32 @@ async fn handle_ws_control(socket: WebSocket, state: AppState) {
         };
         let client_msg = match deserialized_msg.payload {
             WebClientToWebServerControlMessagePayload::TerminalResize(size) => {
+                // Drop resizes from a client that is not the size owner of its
+                // session, so other clients mirror the owner and can never
+                // re-clamp it.
+                if !state
+                    .connection_table
+                    .lock()
+                    .unwrap()
+                    .resize_allowed(&deserialized_msg.web_client_id)
+                {
+                    return;
+                }
                 ClientToServerMsg::TerminalResize(size)
             },
             WebClientToWebServerControlMessagePayload::TerminalPixelDimensions(
                 pixel_dimensions,
             ) => ClientToServerMsg::TerminalPixelDimensions { pixel_dimensions },
             WebClientToWebServerControlMessagePayload::DetachOtherClients => {
-                let kicked = state
+                let others = state
                     .connection_table
                     .lock()
                     .unwrap()
-                    .kick_other_clients_in_session(&deserialized_msg.web_client_id);
+                    .claim_session_size_owner(&deserialized_msg.web_client_id);
                 log::info!(
-                    "DetachOtherClients from {}: kicked {} other client(s)",
+                    "{} claimed session size ownership; {} other client(s) now mirror it",
                     deserialized_msg.web_client_id,
-                    kicked
+                    others
                 );
                 return; // control-only message: nothing to forward to the session server
             },

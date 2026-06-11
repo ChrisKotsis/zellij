@@ -62,6 +62,10 @@ impl ConnectionTable {
             client_channels.cleanup();
         }
         self.client_id_to_session.remove(client_id);
+        // If this client owned a session's size, release ownership so the
+        // remaining clients can resize again.
+        self.session_size_owner
+            .retain(|_, owner| owner.as_str() != client_id);
     }
 
     pub fn set_client_session(&mut self, client_id: &str, session_name: String) {
@@ -69,32 +73,36 @@ impl ConnectionTable {
             .insert(client_id.to_owned(), session_name);
     }
 
-    /// Detach every OTHER web client attached to the same session as
-    /// `requester_id`: send each a "kicked" (4001) close frame and drop it from
-    /// the table. The Zellient client treats 4001 as "don't auto-reconnect".
-    /// The session then resizes to the requester (zellij applies the last
-    /// client's size, and the requester re-asserts it right after this).
-    pub fn kick_other_clients_in_session(&mut self, requester_id: &str) -> usize {
+    /// Make `requester_id` the size owner of its session: every OTHER client of
+    /// that session now mirrors the owner's size (their TerminalResize is
+    /// dropped, see `resize_allowed`) and can never re-clamp it. Returns the
+    /// number of other clients now mirroring. Clients are NOT detached — they
+    /// stay attached and simply follow the owner's size.
+    pub fn claim_session_size_owner(&mut self, requester_id: &str) -> usize {
         let Some(session) = self.client_id_to_session.get(requester_id).cloned() else {
             return 0;
         };
-        let targets: Vec<String> = self
+        let others = self
             .client_id_to_session
             .iter()
             .filter(|(id, sess)| id.as_str() != requester_id && **sess == session)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in &targets {
-            if let Some(control_channel_tx) = self.get_client_control_tx(id) {
-                let close_frame = CloseFrame {
-                    code: 4001u16,
-                    reason: "Detached by another client".into(),
-                };
-                let _ = control_channel_tx.send(Message::Close(Some(close_frame)));
-            }
-            self.remove_client(id);
+            .count();
+        self.session_size_owner
+            .insert(session, requester_id.to_owned());
+        others
+    }
+
+    /// True if `client_id` is allowed to resize its session: allowed when there
+    /// is no size owner for that session, or this client IS the owner. A
+    /// non-owner's resize is dropped so it can only mirror.
+    pub fn resize_allowed(&self, client_id: &str) -> bool {
+        let Some(session) = self.client_id_to_session.get(client_id) else {
+            return true; // unknown session — don't block
+        };
+        match self.session_size_owner.get(session) {
+            Some(owner) => owner == client_id,
+            None => true,
         }
-        targets.len()
     }
 }
 
