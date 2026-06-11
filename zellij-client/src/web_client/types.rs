@@ -95,6 +95,9 @@ impl SessionManager for RealSessionManager {
 #[derive(Debug, Default, Clone)]
 pub struct ConnectionTable {
     pub client_id_to_channels: HashMap<String, ClientChannels>,
+    // web_client_id -> session name it attached to, so "detach other clients"
+    // can be scoped to the requester's session.
+    pub client_id_to_session: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]

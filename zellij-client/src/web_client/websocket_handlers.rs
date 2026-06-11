@@ -67,6 +67,19 @@ async fn handle_ws_control(socket: WebSocket, state: AppState) {
             WebClientToWebServerControlMessagePayload::TerminalPixelDimensions(
                 pixel_dimensions,
             ) => ClientToServerMsg::TerminalPixelDimensions { pixel_dimensions },
+            WebClientToWebServerControlMessagePayload::DetachOtherClients => {
+                let kicked = state
+                    .connection_table
+                    .lock()
+                    .unwrap()
+                    .kick_other_clients_in_session(&deserialized_msg.web_client_id);
+                log::info!(
+                    "DetachOtherClients from {}: kicked {} other client(s)",
+                    deserialized_msg.web_client_id,
+                    kicked
+                );
+                return; // control-only message: nothing to forward to the session server
+            },
         };
 
         let _ = client_connection.send_to_server(client_msg);
@@ -134,6 +147,16 @@ async fn handle_ws_terminal(
         .lock()
         .unwrap()
         .add_client_terminal_tx(&web_client_id, stdout_channel_tx);
+
+    // Record which session this client attached to, so DetachOtherClients can
+    // be scoped to the requester's session.
+    if let Some(AxumPath(ref sname)) = session_name {
+        state
+            .connection_table
+            .lock()
+            .unwrap()
+            .set_client_session(&web_client_id, sname.clone());
+    }
 
     zellij_server_listener(
         os_input.clone(),
