@@ -18,7 +18,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -115,11 +115,28 @@ pub(crate) fn background_jobs_main(
                                                                            // milliseconds
     let last_render_request: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
-    let http_client = HttpClient::builder()
-        // TODO: timeout?
-        .redirect_policy(RedirectPolicy::Follow)
-        .build()
-        .ok();
+    // LOCAL PATCH (isahc SIGSEGV mitigation, 2026-07-11): the client is built
+    // lazily on first use — isahc spawns its curl agent threads the moment the
+    // client is constructed, and those threads have been observed segfaulting
+    // (dmesg: "isahc-agent-N ... segfault ... in zellij"), taking the whole
+    // session server (and every pane in it) down. Upstream 0.44 stops using
+    // isahc for the web-server status query entirely (unix sockets instead).
+    let http_client: OnceLock<Option<HttpClient>> = OnceLock::new();
+    let build_http_client = || {
+        HttpClient::builder()
+            // TODO: timeout?
+            .redirect_policy(RedirectPolicy::Follow)
+            .build()
+            .ok()
+    };
+    // Same patch: the per-session-info-tick (~1s) web-server status poll is the
+    // only steady isahc traffic in a session server — rate-limit it, and let a
+    // spawner opt a server out entirely (work sessions don't need the
+    // status-bar web indicator).
+    let mut last_web_server_status_query: Option<Instant> = None;
+    let web_server_status_query_disabled =
+        std::env::var_os("ZELLIJ_DISABLE_WEB_SERVER_STATUS_QUERY").is_some();
+    const WEB_SERVER_STATUS_QUERY_MIN_INTERVAL: Duration = Duration::from_secs(15);
 
     loop {
         let (event, mut err_ctx) = bus.recv().with_context(err_context)?;
@@ -297,7 +314,7 @@ pub(crate) fn background_jobs_main(
             BackgroundJob::WebRequest(plugin_id, client_id, url, verb, headers, body, context) => {
                 task::spawn({
                     let senders = bus.senders.clone();
-                    let http_client = http_client.clone();
+                    let http_client = http_client.get_or_init(build_http_client).clone();
                     async move {
                         async fn web_request(
                             url: String,
@@ -381,9 +398,21 @@ pub(crate) fn background_jobs_main(
                     // no web server capability, no need to query
                     continue;
                 }
+                // LOCAL PATCH: skip entirely when the spawner opted out, and
+                // never poll more often than the min interval — this job fires
+                // on every session-info tick (~1s) otherwise.
+                if web_server_status_query_disabled {
+                    continue;
+                }
+                if last_web_server_status_query
+                    .map_or(false, |t| t.elapsed() < WEB_SERVER_STATUS_QUERY_MIN_INTERVAL)
+                {
+                    continue;
+                }
+                last_web_server_status_query = Some(Instant::now());
 
                 task::spawn({
-                    let http_client = http_client.clone();
+                    let http_client = http_client.get_or_init(build_http_client).clone();
                     let senders = bus.senders.clone();
                     let web_server_base_url = web_server_base_url.clone();
                     async move {
