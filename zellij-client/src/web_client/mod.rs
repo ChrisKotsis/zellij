@@ -240,11 +240,31 @@ pub async fn serve_web_client(
         is_https,
     };
 
+    // LOCAL PATCH (isahc removal, 2026-07-14): the IPC listener answers
+    // version/status queries, so it needs the address this server is actually
+    // bound to. Prefer the listener's ground truth, fall back to config.
+    let (web_server_ip, web_server_port) = match listener.local_addr() {
+        Ok(addr) => (addr.ip(), addr.port()),
+        Err(_) => (
+            state
+                .config_options
+                .web_server_ip
+                .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            state.config_options.web_server_port.unwrap_or(8082),
+        ),
+    };
     tokio::spawn({
         let server_handle = server_handle.clone();
         let state = state.clone();
         async move {
-            listen_to_web_server_instructions(server_handle, state, &format!("{}", id)).await;
+            listen_to_web_server_instructions(
+                server_handle,
+                state,
+                &format!("{}", id),
+                web_server_ip,
+                web_server_port,
+            )
+            .await;
         }
     });
 

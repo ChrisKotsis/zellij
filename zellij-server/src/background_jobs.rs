@@ -6,6 +6,10 @@ use zellij_utils::consts::{
 use zellij_utils::data::{Event, HttpVerb, SessionInfo, WebServerStatus};
 use zellij_utils::errors::{prelude::*, BackgroundJobContext, ContextType};
 use zellij_utils::input::layout::RunPlugin;
+#[cfg(feature = "web_server_capability")]
+use zellij_utils::shared::parse_base_url;
+#[cfg(feature = "web_server_capability")]
+use zellij_utils::web_server_commands::{discover_webserver_sockets, query_webserver_version};
 
 use isahc::prelude::*;
 use isahc::AsyncReadResponseExt;
@@ -119,8 +123,10 @@ pub(crate) fn background_jobs_main(
     // lazily on first use — isahc spawns its curl agent threads the moment the
     // client is constructed, and those threads have been observed segfaulting
     // (dmesg: "isahc-agent-N ... segfault ... in zellij"), taking the whole
-    // session server (and every pane in it) down. Upstream 0.44 stops using
-    // isahc for the web-server status query entirely (unix sockets instead).
+    // session server (and every pane in it) down. As of the 2026-07-14 patch
+    // the web-server status poll goes over a unix socket instead, so this
+    // client only serves plugin WebRequests — a session server whose plugins
+    // never issue one runs zero isahc threads, ever.
     let http_client: OnceLock<Option<HttpClient>> = OnceLock::new();
     let build_http_client = || {
         HttpClient::builder()
@@ -129,9 +135,8 @@ pub(crate) fn background_jobs_main(
             .build()
             .ok()
     };
-    // Same patch: the per-session-info-tick (~1s) web-server status poll is the
-    // only steady isahc traffic in a session server — rate-limit it, and let a
-    // spawner opt a server out entirely (work sessions don't need the
+    // Rate-limit the per-session-info-tick (~1s) web-server status poll, and
+    // let a spawner opt a server out entirely (work sessions don't need the
     // status-bar web indicator).
     let mut last_web_server_status_query: Option<Instant> = None;
     let web_server_status_query_disabled =
@@ -394,99 +399,44 @@ pub(crate) fn background_jobs_main(
                 });
             },
             BackgroundJob::QueryZellijWebServerStatus => {
-                if !cfg!(feature = "web_server_capability") {
-                    // no web server capability, no need to query
-                    continue;
-                }
-                // LOCAL PATCH: skip entirely when the spawner opted out, and
-                // never poll more often than the min interval — this job fires
-                // on every session-info tick (~1s) otherwise.
-                if web_server_status_query_disabled {
-                    continue;
-                }
-                if last_web_server_status_query
-                    .map_or(false, |t| t.elapsed() < WEB_SERVER_STATUS_QUERY_MIN_INTERVAL)
+                // LOCAL PATCH (isahc removal, 2026-07-14): query the web
+                // server over its unix IPC socket instead of an isahc HTTP
+                // request. isahc's curl agent threads SIGSEGV sporadically
+                // (dmesg: "isahc-agent-N ... segfault ... in zellij") and take
+                // the whole session server — every pane in every session it
+                // hosts — down with them. Upstream also moved this poll off
+                // isahc onto unix-socket queries after 0.43.1.
+                #[cfg(feature = "web_server_capability")]
                 {
-                    continue;
-                }
-                last_web_server_status_query = Some(Instant::now());
-
-                task::spawn({
-                    let http_client = http_client.get_or_init(build_http_client).clone();
-                    let senders = bus.senders.clone();
-                    let web_server_base_url = web_server_base_url.clone();
-                    async move {
-                        async fn web_request(
-                            http_client: HttpClient,
-                            web_server_base_url: &str,
-                        ) -> Result<
-                            (u16, Vec<u8>), // status_code, body
-                            isahc::Error,
-                        > {
-                            let request =
-                                Request::get(format!("{}/info/version", web_server_base_url,));
-                            let req = request.body(())?;
-                            let mut res = http_client.send_async(req).await?;
-
-                            let status_code = res.status();
-                            let body = res.bytes().await?;
-                            Ok((status_code.as_u16(), body))
-                        }
-                        let Some(http_client) = http_client else {
-                            log::error!("Cannot perform http request, likely due to a misconfigured http client");
-                            return;
-                        };
-
-                        let http_client = http_client.clone();
-                        match web_request(http_client, &web_server_base_url).await {
-                            Ok((status, body)) => {
-                                if status == 200 && &body == VERSION.as_bytes() {
-                                    // online
-                                    let _ =
-                                        senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                            None,
-                                            None,
-                                            Event::WebServerStatus(WebServerStatus::Online(
-                                                web_server_base_url.clone(),
-                                            )),
-                                        )]));
-                                } else if status == 200 {
-                                    let _ =
-                                        senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                            None,
-                                            None,
-                                            Event::WebServerStatus(
-                                                WebServerStatus::DifferentVersion(
-                                                    String::from_utf8_lossy(&body).to_string(),
-                                                ),
-                                            ),
-                                        )]));
-                                } else {
-                                    // offline/error
-                                    let _ =
-                                        senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                            None,
-                                            None,
-                                            Event::WebServerStatus(WebServerStatus::Offline),
-                                        )]));
-                                }
-                            },
-                            Err(e) => {
-                                if e.kind() == isahc::error::ErrorKind::ConnectionFailed {
-                                    let _ =
-                                        senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                            None,
-                                            None,
-                                            Event::WebServerStatus(WebServerStatus::Offline),
-                                        )]));
-                                } else {
-                                    // no-op - otherwise we'll get errors if we were mid-request
-                                    // (eg. when the server was shut down by a user action)
-                                }
-                            },
-                        }
+                    // Skip entirely when the spawner opted out, and never poll
+                    // more often than the min interval — this job fires on
+                    // every session-info tick (~1s) otherwise.
+                    if web_server_status_query_disabled {
+                        continue;
                     }
-                });
+                    if last_web_server_status_query
+                        .map_or(false, |t| t.elapsed() < WEB_SERVER_STATUS_QUERY_MIN_INTERVAL)
+                    {
+                        continue;
+                    }
+                    last_web_server_status_query = Some(Instant::now());
+
+                    // Detached thread: the query is synchronous socket I/O
+                    // with short timeouts — don't stall this loop on it.
+                    std::thread::spawn({
+                        let senders = bus.senders.clone();
+                        let web_server_base_url = web_server_base_url.clone();
+                        move || {
+                            let status = query_webserver_via_ipc(&web_server_base_url)
+                                .unwrap_or(WebServerStatus::Offline);
+                            let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                                None,
+                                None,
+                                Event::WebServerStatus(status),
+                            )]));
+                        }
+                    });
+                }
             },
             BackgroundJob::RenderToClients => {
                 // last_render_request being Some() represents a render request that is pending
@@ -701,4 +651,31 @@ fn find_resurrectable_sessions(
             BTreeMap::new()
         },
     }
+}
+
+// LOCAL PATCH (isahc removal, 2026-07-14): backport of upstream's unix-socket
+// web-server status query. Discovers running web server instances via their
+// IPC sockets and asks each for its version and bound address — no HTTP, no
+// isahc, no curl agent threads in the session server.
+#[cfg(feature = "web_server_capability")]
+fn query_webserver_via_ipc(web_server_base_url: &str) -> Result<WebServerStatus> {
+    let expected_addr = parse_base_url(web_server_base_url)
+        .context("Failed to parse web server base URL")?;
+    let sockets = discover_webserver_sockets().context("Failed to discover web server sockets")?;
+    for socket_path in sockets {
+        match query_webserver_version(&socket_path, Duration::from_millis(500)) {
+            Ok(info) => {
+                if info.ip != expected_addr.ip || info.port != expected_addr.port {
+                    continue;
+                }
+                if info.version == VERSION {
+                    return Ok(WebServerStatus::Online(web_server_base_url.to_string()));
+                } else {
+                    return Ok(WebServerStatus::DifferentVersion(info.version));
+                }
+            },
+            Err(_) => continue,
+        }
+    }
+    Ok(WebServerStatus::Offline)
 }

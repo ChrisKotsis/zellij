@@ -192,6 +192,28 @@ pub fn web_server_base_url(
     format!("{}://{}:{}", url_prefix, web_server_ip, web_server_port)
 }
 
+// LOCAL PATCH (isahc removal, 2026-07-14): backported from upstream so the
+// session server can compare its configured web server address against what a
+// web server instance reports over IPC.
+pub struct ServerAddress {
+    pub ip: String,
+    pub port: u16,
+}
+
+pub fn parse_base_url(url: &str) -> crate::errors::prelude::Result<ServerAddress> {
+    use crate::errors::prelude::anyhow;
+    let url = url::Url::parse(url)?;
+    let ip = url
+        .host_str()
+        .ok_or_else(|| anyhow!("No host in URL"))?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("No port in URL"))?;
+
+    Ok(ServerAddress { ip, port })
+}
+
 pub fn web_server_base_url_from_config(config_options: Options) -> String {
     let web_server_ip = config_options
         .web_server_ip

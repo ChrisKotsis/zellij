@@ -2,11 +2,12 @@ use crate::web_client::types::AppState;
 
 use super::control_message::{SetConfigPayload, WebServerToWebClientControlMessage};
 use axum_server::Handle;
-use tokio::io::AsyncReadExt;
+use std::net::IpAddr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use zellij_utils::consts::WEBSERVER_SOCKET_PATH;
+use zellij_utils::consts::{VERSION, WEBSERVER_SOCKET_PATH};
 use zellij_utils::ipc::ClientToServerMsg;
-use zellij_utils::web_server_commands::InstructionForWebServer;
+use zellij_utils::web_server_commands::{InstructionForWebServer, VersionInfo, WebServerResponse};
 
 pub async fn create_webserver_receiver(
     id: &str,
@@ -33,7 +34,13 @@ pub async fn receive_webserver_instruction(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
-pub async fn listen_to_web_server_instructions(server_handle: Handle, state: AppState, id: &str) {
+pub async fn listen_to_web_server_instructions(
+    server_handle: Handle,
+    state: AppState,
+    id: &str,
+    web_server_ip: IpAddr,
+    web_server_port: u16,
+) {
     loop {
         let receiver = create_webserver_receiver(id).await;
         match receiver {
@@ -43,6 +50,28 @@ pub async fn listen_to_web_server_instructions(server_handle: Handle, state: App
                         InstructionForWebServer::ShutdownWebServer => {
                             server_handle.shutdown();
                             break;
+                        },
+                        // LOCAL PATCH (isahc removal, 2026-07-14): answer the
+                        // session server's status query on the same stream —
+                        // it half-closes its write side, we respond and drop
+                        // the stream (EOF) so it knows the response is done.
+                        InstructionForWebServer::QueryVersion => {
+                            let response = WebServerResponse::Version(VersionInfo {
+                                version: VERSION.to_string(),
+                                ip: web_server_ip.to_string(),
+                                port: web_server_port,
+                            });
+                            match rmp_serde::to_vec(&response) {
+                                Ok(bytes) => {
+                                    if let Err(e) = receiver.write_all(&bytes).await {
+                                        log::error!("Failed to send version response: {}", e);
+                                    }
+                                },
+                                Err(e) => {
+                                    log::error!("Failed to serialize version response: {}", e);
+                                },
+                            }
+                            // Continue loop to recreate receiver for next message
                         },
                         InstructionForWebServer::ConfigWrittenToDisk(new_config) => {
                             let set_config_payload = SetConfigPayload::from(&new_config);
