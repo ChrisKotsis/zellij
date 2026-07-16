@@ -44,7 +44,7 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 insta = "1.6.0"
-isahc = { version = "1.7.2", default-features = false, features = ["http2", "text-decoding"] } # tests only — NEVER ship isahc in the binary
+ureq = { workspace = true }
 tokio-tungstenite = "0.20"
 futures-util = "0.3"
 urlencoding = "2.1"

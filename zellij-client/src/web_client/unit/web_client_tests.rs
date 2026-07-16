@@ -1,7 +1,31 @@
 use super::serve_web_client;
 use super::*;
 use futures_util::{SinkExt, StreamExt};
-use isahc::prelude::*;
+
+// LOCAL PATCH (isahc removal, 2026-07-15): test HTTP goes through ureq.
+// ureq surfaces non-2xx statuses as Err(Error::Status) — these shims fold
+// them back into Ok(response) so tests can assert on real status codes.
+fn http_get(url: &str) -> Result<ureq::Response, ureq::Error> {
+    match ureq::get(url).call() {
+        Err(ureq::Error::Status(_, response)) => Ok(response),
+        other => other,
+    }
+}
+
+fn http_post(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Result<ureq::Response, ureq::Error> {
+    let mut request = ureq::post(url);
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    match request.send_string(body) {
+        Err(ureq::Error::Status(_, response)) => Ok(response),
+        other => other,
+    }
+}
 use serde_json;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -39,7 +63,7 @@ mod web_client_tests {
         while start.elapsed() < timeout {
             match tokio::task::spawn_blocking({
                 let url = url.clone();
-                move || isahc::get(&url)
+                move || http_get(&url)
             })
             .await
             {
@@ -97,16 +121,16 @@ mod web_client_tests {
 
         let mut response = timeout(
             Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || isahc::get(&url)),
+            tokio::task::spawn_blocking(move || http_get(&url)),
         )
         .await
         .expect("Request timed out")
         .expect("Spawn blocking failed")
         .expect("Request failed");
 
-        assert!(response.status().is_success());
+        assert!((200..300).contains(&response.status()));
 
-        let version_text = response.text().expect("Failed to read response body");
+        let version_text = response.into_string().expect("Failed to read response body");
         assert_eq!(version_text, VERSION);
 
         server_handle.abort();
@@ -162,11 +186,7 @@ mod web_client_tests {
         let mut response = timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
-                isahc::Request::post(&login_url)
-                    .header("Content-Type", "application/json")
-                    .body(login_payload.to_string())
-                    .unwrap()
-                    .send()
+                http_post(&login_url, &[("Content-Type", "application/json")], &login_payload.to_string())
             }),
         )
         .await
@@ -174,9 +194,9 @@ mod web_client_tests {
         .expect("Spawn blocking failed")
         .expect("Login request failed");
 
-        assert!(response.status().is_success());
+        assert!((200..300).contains(&response.status()));
 
-        let response_text = response.text().expect("Failed to read response body");
+        let response_text = response.into_string().expect("Failed to read response body");
         let response_json: serde_json::Value =
             serde_json::from_str(&response_text).expect("Failed to parse JSON");
 
@@ -233,11 +253,7 @@ mod web_client_tests {
         let response = timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
-                isahc::Request::post(&login_url)
-                    .header("Content-Type", "application/json")
-                    .body(login_payload.to_string())
-                    .unwrap()
-                    .send()
+                http_post(&login_url, &[("Content-Type", "application/json")], &login_payload.to_string())
             }),
         )
         .await
@@ -298,11 +314,7 @@ mod web_client_tests {
         let login_response = timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
-                isahc::Request::post(&login_url)
-                    .header("Content-Type", "application/json")
-                    .body(login_payload.to_string())
-                    .unwrap()
-                    .send()
+                http_post(&login_url, &[("Content-Type", "application/json")], &login_payload.to_string())
             }),
         )
         .await
@@ -310,14 +322,14 @@ mod web_client_tests {
         .unwrap()
         .unwrap();
 
-        assert!(login_response.status().is_success());
+        assert!((200..300).contains(&login_response.status()));
 
-        let set_cookie_header = login_response.headers().get("set-cookie");
+        let set_cookie_header = login_response.header("set-cookie");
         assert!(
             set_cookie_header.is_some(),
             "Should have received session cookie"
         );
-        let cookie_value = set_cookie_header.unwrap().to_str().unwrap();
+        let cookie_value = set_cookie_header.unwrap();
         let session_token = cookie_value
             .split(';')
             .next()
@@ -332,12 +344,7 @@ mod web_client_tests {
             tokio::task::spawn_blocking({
                 let session_token = session_token.to_string();
                 move || {
-                    isahc::Request::post(&session_url)
-                        .header("Cookie", format!("session_token={}", session_token))
-                        .header("Content-Type", "application/json")
-                        .body("{}")
-                        .unwrap()
-                        .send()
+                    http_post(&session_url, &[("Cookie", &format!("session_token={}", session_token)), ("Content-Type", "application/json")], "{}")
                 }
             }),
         )
@@ -346,10 +353,10 @@ mod web_client_tests {
         .unwrap()
         .unwrap();
 
-        assert!(client_response.status().is_success());
+        assert!((200..300).contains(&client_response.status()));
 
         let client_data: serde_json::Value =
-            serde_json::from_str(&client_response.text().unwrap()).unwrap();
+            serde_json::from_str(&client_response.into_string().unwrap()).unwrap();
         let web_client_id = client_data["web_client_id"].as_str().unwrap().to_string();
 
         println!("✓ Successfully created client session");
@@ -500,7 +507,7 @@ mod web_client_tests {
         let session_url = format!("http://127.0.0.1:{}/session", port);
         let response = timeout(
             Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || isahc::post(&session_url, "{}")),
+            tokio::task::spawn_blocking(move || http_post(&session_url, &[], "{}")),
         )
         .await
         .expect("Session request timed out")
@@ -550,12 +557,14 @@ mod web_client_tests {
         let response = timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
-                isahc::Request::post(&session_url)
-                    .header("Cookie", "session_token=invalid_session_token_123")
-                    .header("Content-Type", "application/json")
-                    .body("{}")
-                    .unwrap()
-                    .send()
+                http_post(
+                    &session_url,
+                    &[
+                        ("Cookie", "session_token=invalid_session_token_123"),
+                        ("Content-Type", "application/json"),
+                    ],
+                    "{}",
+                )
             }),
         )
         .await
@@ -1176,11 +1185,7 @@ mod web_client_tests {
         let login_response = timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
-                isahc::Request::post(&login_url)
-                    .header("Content-Type", "application/json")
-                    .body(login_payload.to_string())
-                    .unwrap()
-                    .send()
+                http_post(&login_url, &[("Content-Type", "application/json")], &login_payload.to_string())
             }),
         )
         .await
@@ -1188,10 +1193,10 @@ mod web_client_tests {
         .unwrap()
         .unwrap();
 
-        assert!(login_response.status().is_success());
+        assert!((200..300).contains(&login_response.status()));
 
-        let set_cookie_header = login_response.headers().get("set-cookie").unwrap();
-        let cookie_value = set_cookie_header.to_str().unwrap();
+        let set_cookie_header = login_response.header("set-cookie").unwrap();
+        let cookie_value = set_cookie_header;
         cookie_value
             .split(';')
             .next()
@@ -1208,12 +1213,7 @@ mod web_client_tests {
             tokio::task::spawn_blocking({
                 let session_token = session_token.to_string();
                 move || {
-                    isahc::Request::post(&session_url)
-                        .header("Cookie", format!("session_token={}", session_token))
-                        .header("Content-Type", "application/json")
-                        .body("{}")
-                        .unwrap()
-                        .send()
+                    http_post(&session_url, &[("Cookie", &format!("session_token={}", session_token)), ("Content-Type", "application/json")], "{}")
                 }
             }),
         )
@@ -1222,10 +1222,10 @@ mod web_client_tests {
         .unwrap()
         .unwrap();
 
-        assert!(client_response.status().is_success());
+        assert!((200..300).contains(&client_response.status()));
 
         let client_data: serde_json::Value =
-            serde_json::from_str(&client_response.text().unwrap()).unwrap();
+            serde_json::from_str(&client_response.into_string().unwrap()).unwrap();
         client_data["web_client_id"].as_str().unwrap().to_string()
     }
 
