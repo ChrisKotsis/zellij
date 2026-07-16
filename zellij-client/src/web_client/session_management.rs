@@ -101,15 +101,20 @@ pub fn spawn_session_if_needed(
     os_input: Box<dyn ClientOsApi>,
     requested_layout: Option<LayoutInfo>,
     is_welcome_screen: bool,
-) -> (ClientToServerMsg, PathBuf) {
+) -> Result<(ClientToServerMsg, PathBuf), String> {
+    // LOCAL PATCH (web-daemon panic fix, 2026-07-15): this returns Result so a
+    // layout that fails to resolve fails THIS connection instead of panicking
+    // the shared web daemon. The old code swallowed the ConfigError with
+    // `.ok()` and then `layout.unwrap()`ed a None inside spawn_new_session —
+    // dmesg-correlated with every wholesale session death Jul 11-15.
     if session_exists(&session_name).unwrap_or(false) {
-        ipc_pipe_and_first_message_for_existing_session(
+        Ok(ipc_pipe_and_first_message_for_existing_session(
             path,
             client_attributes,
             &config,
             &config_options,
             is_web_client,
-        )
+        ))
     } else {
         let force_run_commands = false;
         let resurrection_layout =
@@ -123,30 +128,28 @@ pub fn spawn_session_if_needed(
                     resurrection_layout
                 });
 
-        match resurrection_layout {
-            Some(resurrection_layout) => spawn_new_session(
-                &session_name,
-                os_input.clone(),
-                config.clone(),
-                config_options.clone(),
-                Some(resurrection_layout),
-                client_attributes,
-                is_welcome_screen,
-            ),
-            None => {
-                let new_session_layout = layout_for_new_session(&config, requested_layout);
-
-                spawn_new_session(
-                    &session_name,
-                    os_input.clone(),
-                    config.clone(),
-                    config_options.clone(),
-                    new_session_layout.ok().map(|(l, _c)| l),
-                    client_attributes,
-                    is_welcome_screen,
-                )
-            },
-        }
+        // Resolve the layout BEFORE spawning the session server so a bad
+        // layout cannot leave an orphaned, clientless server behind.
+        let layout = match resurrection_layout {
+            Some(resurrection_layout) => resurrection_layout,
+            None => layout_for_new_session(&config, requested_layout)
+                .map(|(layout, _config)| layout)
+                .map_err(|e| {
+                    format!(
+                        "Failed to resolve layout for new session {:?}: {}",
+                        session_name, e
+                    )
+                })?,
+        };
+        Ok(spawn_new_session(
+            &session_name,
+            os_input.clone(),
+            config.clone(),
+            config_options.clone(),
+            layout,
+            client_attributes,
+            is_welcome_screen,
+        ))
     }
 }
 
@@ -155,7 +158,7 @@ fn spawn_new_session(
     mut os_input: Box<dyn ClientOsApi>,
     mut config: Config,
     config_opts: Options,
-    layout: Option<Layout>,
+    layout: Layout,
     client_attributes: ClientAttributes,
     is_welcome_screen: bool,
 ) -> (ClientToServerMsg, PathBuf) {
@@ -189,7 +192,7 @@ fn spawn_new_session(
             Box::new(cli_args),
             Box::new(config.clone()),
             Box::new(config_opts.clone()),
-            Box::new(layout.unwrap()),
+            Box::new(layout),
             Box::new(config.plugins.clone()),
             should_launch_setup_wizard,
             is_web_client,

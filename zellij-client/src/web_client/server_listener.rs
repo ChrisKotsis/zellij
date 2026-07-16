@@ -82,17 +82,38 @@ pub fn zellij_server_listener(
                         .to_owned();
 
                     let is_web_client = true;
-                    let (first_message, zellij_ipc_pipe) = session_manager.spawn_session_if_needed(
-                        &session_name,
-                        path,
-                        client_attributes,
-                        &config,
-                        &config_options,
-                        is_web_client,
-                        os_input.clone(),
-                        reconnect_info.as_ref().and_then(|r| r.layout.clone()),
-                        is_welcome_screen,
-                    );
+                    // LOCAL PATCH (web-daemon panic fix, 2026-07-15): a session
+                    // that cannot be spawned (eg. unresolvable layout) fails
+                    // this connection loudly instead of panicking this thread —
+                    // the panic killed the shared web daemon, and the systemd
+                    // unit cycle then cgroup-killed every co-located session
+                    // server (the "all sessions die at once" incidents).
+                    let (first_message, zellij_ipc_pipe) = match session_manager
+                        .spawn_session_if_needed(
+                            &session_name,
+                            path,
+                            client_attributes,
+                            &config,
+                            &config_options,
+                            is_web_client,
+                            os_input.clone(),
+                            reconnect_info.as_ref().and_then(|r| r.layout.clone()),
+                            is_welcome_screen,
+                        ) {
+                        Ok(msg_and_pipe) => msg_and_pipe,
+                        Err(e) => {
+                            log::error!(
+                                "Failed to spawn session {:?}: {}",
+                                session_name,
+                                e
+                            );
+                            client_connection_bus.send_stdout(format!(
+                                "\r\nError creating session {:?}: {}\r\n",
+                                session_name, e
+                            ));
+                            return;
+                        },
+                    };
 
                     os_input.connect_to_server(&zellij_ipc_pipe);
                     os_input.send_to_server(first_message);

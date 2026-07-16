@@ -1695,6 +1695,31 @@ impl LayoutInfo {
                 {
                     Some(LayoutInfo::Url(default_layout.display().to_string()))
                 } else {
+                    // LOCAL PATCH (web-daemon layout resolution, 2026-07-15):
+                    // a bare layout name (eg. "clean") usually names a file in
+                    // the layout dir, not a built-in asset. Resolve it as a
+                    // file when one exists (with or without .kdl), falling
+                    // back to built-in only otherwise — upstream does the same
+                    // after 0.43.1. Before this, default_layout "clean" was
+                    // classified BuiltIn, failed to load from assets, and the
+                    // swallowed error panicked the web daemon on every
+                    // new-session spawn.
+                    if let Some(layout_dir) = layout_dir
+                        .as_ref()
+                        .map(|l| l.clone())
+                        .or_else(default_layout_dir)
+                    {
+                        let file_path = layout_dir.join(default_layout);
+                        if file_path.exists() {
+                            return Some(LayoutInfo::File(file_path.display().to_string()));
+                        }
+                        let file_path_with_ext = file_path.with_extension("kdl");
+                        if file_path_with_ext.exists() {
+                            return Some(LayoutInfo::File(
+                                file_path_with_ext.display().to_string(),
+                            ));
+                        }
+                    }
                     Some(LayoutInfo::BuiltIn(default_layout.display().to_string()))
                 }
             },

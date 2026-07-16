@@ -1298,7 +1298,7 @@ impl SessionManager for MockSessionManager {
         _os_input: Box<dyn ClientOsApi>,
         _requested_layout: Option<LayoutInfo>,
         _is_welcome_screen: bool,
-    ) -> (ClientToServerMsg, PathBuf) {
+    ) -> Result<(ClientToServerMsg, PathBuf), String> {
         let mock_ipc_path = PathBuf::from(format!("/tmp/mock_zellij_{}", session_name));
 
         let first_message = ClientToServerMsg::AttachClient(
@@ -1310,7 +1310,7 @@ impl SessionManager for MockSessionManager {
             is_web_client,
         );
 
-        (first_message, mock_ipc_path)
+        Ok((first_message, mock_ipc_path))
     }
 }
 

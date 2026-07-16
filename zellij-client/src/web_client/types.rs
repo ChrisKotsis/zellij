@@ -45,7 +45,7 @@ pub trait SessionManager: Send + Sync + std::fmt::Debug {
         os_input: Box<dyn ClientOsApi>,
         requested_layout: Option<LayoutInfo>,
         is_welcome_screen: bool,
-    ) -> (ClientToServerMsg, PathBuf);
+    ) -> Result<(ClientToServerMsg, PathBuf), String>;
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +77,7 @@ impl SessionManager for RealSessionManager {
         os_input: Box<dyn ClientOsApi>,
         requested_layout: Option<LayoutInfo>,
         is_welcome_screen: bool,
-    ) -> (ClientToServerMsg, PathBuf) {
+    ) -> Result<(ClientToServerMsg, PathBuf), String> {
         crate::web_client::session_management::spawn_session_if_needed(
             session_name,
             path,
