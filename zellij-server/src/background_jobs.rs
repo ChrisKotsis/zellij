@@ -11,18 +11,15 @@ use zellij_utils::shared::parse_base_url;
 #[cfg(feature = "web_server_capability")]
 use zellij_utils::web_server_commands::{discover_webserver_sockets, query_webserver_version};
 
-use isahc::prelude::*;
-use isahc::AsyncReadResponseExt;
-use isahc::{config::RedirectPolicy, HttpClient, Request};
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
@@ -119,22 +116,6 @@ pub(crate) fn background_jobs_main(
                                                                            // milliseconds
     let last_render_request: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
-    // LOCAL PATCH (isahc SIGSEGV mitigation, 2026-07-11): the client is built
-    // lazily on first use — isahc spawns its curl agent threads the moment the
-    // client is constructed, and those threads have been observed segfaulting
-    // (dmesg: "isahc-agent-N ... segfault ... in zellij"), taking the whole
-    // session server (and every pane in it) down. As of the 2026-07-14 patch
-    // the web-server status poll goes over a unix socket instead, so this
-    // client only serves plugin WebRequests — a session server whose plugins
-    // never issue one runs zero isahc threads, ever.
-    let http_client: OnceLock<Option<HttpClient>> = OnceLock::new();
-    let build_http_client = || {
-        HttpClient::builder()
-            // TODO: timeout?
-            .redirect_policy(RedirectPolicy::Follow)
-            .build()
-            .ok()
-    };
     // Rate-limit the per-session-info-tick (~1s) web-server status poll, and
     // let a spawner opt a server out entirely (work sessions don't need the
     // status-bar web indicator).
@@ -317,84 +298,31 @@ pub(crate) fn background_jobs_main(
                 });
             },
             BackgroundJob::WebRequest(plugin_id, client_id, url, verb, headers, body, context) => {
-                task::spawn({
+                // LOCAL PATCH (isahc removal, 2026-07-15): plugin web requests
+                // go through ureq — a blocking client with no background agent
+                // threads — on a detached thread, mirroring the IPC status
+                // query below. isahc's curl agent threads SIGSEGV sporadically
+                // (dmesg: "isahc-agent-N ... segfault ... in zellij") and took
+                // the whole session server down with them.
+                std::thread::spawn({
                     let senders = bus.senders.clone();
-                    let http_client = http_client.get_or_init(build_http_client).clone();
-                    async move {
-                        async fn web_request(
-                            url: String,
-                            verb: HttpVerb,
-                            headers: BTreeMap<String, String>,
-                            body: Vec<u8>,
-                            http_client: HttpClient,
-                        ) -> Result<
-                            (u16, BTreeMap<String, String>, Vec<u8>), // status_code, headers, body
-                            isahc::Error,
-                        > {
-                            let mut request = match verb {
-                                HttpVerb::Get => Request::get(url),
-                                HttpVerb::Post => Request::post(url),
-                                HttpVerb::Put => Request::put(url),
-                                HttpVerb::Delete => Request::delete(url),
-                            };
-                            for (header, value) in headers {
-                                request = request.header(header.as_str(), value);
-                            }
-                            let mut res = if !body.is_empty() {
-                                let req = request.body(body)?;
-                                http_client.send_async(req).await?
-                            } else {
-                                let req = request.body(())?;
-                                http_client.send_async(req).await?
-                            };
-
-                            let status_code = res.status();
-                            let headers: BTreeMap<String, String> = res
-                                .headers()
-                                .iter()
-                                .filter_map(|(name, value)| match value.to_str() {
-                                    Ok(value) => Some((name.to_string(), value.to_string())),
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to convert header {:?} to string: {:?}",
-                                            name,
-                                            e
-                                        );
-                                        None
-                                    },
-                                })
-                                .collect();
-                            let body = res.bytes().await?;
-                            Ok((status_code.as_u16(), headers, body))
-                        }
-                        let Some(http_client) = http_client else {
-                            log::error!("Cannot perform http request, likely due to a misconfigured http client");
-                            return;
-                        };
-
-                        match web_request(url, verb, headers, body, http_client).await {
-                            Ok((status, headers, body)) => {
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::WebRequestResult(status, headers, body, context),
-                                )]));
-                            },
-                            Err(e) => {
-                                log::error!("Failed to send web request: {}", e);
-                                let error_body = e.to_string().as_bytes().to_vec();
-                                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-                                    Some(plugin_id),
-                                    Some(client_id),
-                                    Event::WebRequestResult(
-                                        400,
-                                        BTreeMap::new(),
-                                        error_body,
-                                        context,
-                                    ),
-                                )]));
-                            },
-                        }
+                    move || match blocking_web_request(&url, verb, headers, body) {
+                        Ok((status, headers, body)) => {
+                            let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                                Some(plugin_id),
+                                Some(client_id),
+                                Event::WebRequestResult(status, headers, body, context),
+                            )]));
+                        },
+                        Err(e) => {
+                            log::error!("Failed to send web request: {}", e);
+                            let error_body = e.as_bytes().to_vec();
+                            let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                                Some(plugin_id),
+                                Some(client_id),
+                                Event::WebRequestResult(400, BTreeMap::new(), error_body, context),
+                            )]));
+                        },
                     }
                 });
             },
@@ -651,6 +579,53 @@ fn find_resurrectable_sessions(
             BTreeMap::new()
         },
     }
+}
+
+// LOCAL PATCH (isahc removal, 2026-07-15): plugin WebRequests on ureq — no
+// curl agent threads, blocking I/O confined to its own detached thread. A
+// non-2xx HTTP status is reported to the plugin as a real response with that
+// status, not flattened into a transport error.
+fn blocking_web_request(
+    url: &str,
+    verb: HttpVerb,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+) -> Result<(u16, BTreeMap<String, String>, Vec<u8>), String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .build();
+    let mut request = match verb {
+        HttpVerb::Get => agent.get(url),
+        HttpVerb::Post => agent.post(url),
+        HttpVerb::Put => agent.put(url),
+        HttpVerb::Delete => agent.delete(url),
+    };
+    for (header, value) in headers {
+        request = request.set(&header, &value);
+    }
+    let response = if !body.is_empty() {
+        request.send_bytes(&body)
+    } else {
+        request.call()
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_code, response)) => response,
+        Err(e) => return Err(e.to_string()),
+    };
+    let status_code = response.status();
+    let mut response_headers = BTreeMap::new();
+    for name in response.headers_names() {
+        if let Some(value) = response.header(&name) {
+            response_headers.insert(name.clone(), value.to_string());
+        }
+    }
+    let mut response_body = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut response_body)
+        .map_err(|e| e.to_string())?;
+    Ok((status_code, response_headers, response_body))
 }
 
 // LOCAL PATCH (isahc removal, 2026-07-14): backport of upstream's unix-socket

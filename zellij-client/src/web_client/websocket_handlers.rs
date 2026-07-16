@@ -77,7 +77,7 @@ async fn handle_ws_control(socket: WebSocket, state: AppState) {
             },
             WebClientToWebServerControlMessagePayload::TerminalPixelDimensions(
                 pixel_dimensions,
-            ) => ClientToServerMsg::TerminalPixelDimensions { pixel_dimensions },
+            ) => ClientToServerMsg::TerminalPixelDimensions(pixel_dimensions),
             WebClientToWebServerControlMessagePayload::DetachOtherClients => {
                 let others = state
                     .connection_table

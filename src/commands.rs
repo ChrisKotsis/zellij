@@ -2,8 +2,6 @@ use dialoguer::Confirm;
 use std::net::IpAddr;
 use std::{fs::File, io::prelude::*, path::PathBuf, process, time::Duration};
 
-#[cfg(feature = "web_server_capability")]
-use isahc::{config::RedirectPolicy, prelude::*, HttpClient, Request};
 
 use nix;
 use zellij_client::{
@@ -26,6 +24,8 @@ use zellij_client::web_client::start_web_client as start_web_client_impl;
 
 #[cfg(feature = "web_server_capability")]
 use zellij_utils::web_server_commands::shutdown_all_webserver_instances;
+#[cfg(feature = "web_server_capability")]
+use zellij_utils::web_server_commands::{discover_webserver_sockets, query_webserver_version};
 
 #[cfg(feature = "web_server_capability")]
 use zellij_utils::web_authentication_tokens::{
@@ -311,25 +311,26 @@ pub(crate) fn list_auth_tokens() -> Result<Vec<String>, String> {
 }
 
 #[cfg(feature = "web_server_capability")]
-pub(crate) fn web_server_status(web_server_base_url: &str) -> Result<String, String> {
-    let http_client = HttpClient::builder()
-        // TODO: timeout?
-        .redirect_policy(RedirectPolicy::Follow)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let request = Request::get(format!("{}/info/version", web_server_base_url,));
-    let req = request.body(()).map_err(|e| e.to_string())?;
-    let mut res = http_client.send(req).map_err(|e| e.to_string())?;
-    let status_code = res.status();
-    if status_code == 200 {
-        let body = res.bytes().map_err(|e| e.to_string())?;
-        Ok(String::from_utf8_lossy(&body).to_string())
-    } else {
-        Err(format!(
-            "Failed to stop web server, got status code: {}",
-            status_code
-        ))
+pub(crate) fn web_server_status(_web_server_base_url: &str) -> Result<String, String> {
+    // LOCAL PATCH (isahc removal, 2026-07-15): query the web server's version
+    // over its unix IPC socket instead of an isahc HTTP request — the same
+    // transport the session server's status poll uses. isahc's curl agent
+    // threads SIGSEGV sporadically (dmesg: "isahc-agent-N ... segfault ... in
+    // zellij"), and this CLI was the last eager isahc client in the binary.
+    let sockets = discover_webserver_sockets().map_err(|e| e.to_string())?;
+    if sockets.is_empty() {
+        return Err("no web server IPC sockets found".to_string());
     }
+    let mut last_error = "no web server responded".to_string();
+    for socket in sockets {
+        match query_webserver_version(&socket, Duration::from_secs(3)) {
+            Ok(info) => return Ok(info.version),
+            Err(e) => {
+                last_error = format!("{}: {}", socket.display(), e);
+            },
+        }
+    }
+    Err(last_error)
 }
 
 #[cfg(not(feature = "web_server_capability"))]

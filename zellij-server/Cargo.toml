@@ -24,7 +24,7 @@ close_fds = { version = "0.3.2", default-features = false }
 daemonize = { workspace = true }
 highway = { version = "0.6.4", default-features = false, features = ["std"] }
 interprocess = { workspace = true }
-isahc = { workspace = true }
+ureq = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }

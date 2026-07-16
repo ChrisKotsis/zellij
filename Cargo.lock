@@ -2827,15 +2827,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff011a302c396a5197692431fc1948019154afc178baf7d8e37367442a4601cf"
 
 [[package]]
-name = "openssl-src"
-version = "300.1.6+3.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "439fac53e092cd7442a3660c85dde4643ab3b5bd39040912388dcdabf6b88085"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "openssl-sys"
 version = "0.9.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2843,7 +2834,6 @@ checksum = "db4d56a4c0478783083cfafcc42493dd4a981d41669da64b4572a2a089b51b1d"
 dependencies = [
  "cc",
  "libc",
- "openssl-src",
  "pkg-config",
  "vcpkg",
 ]
@@ -3545,7 +3535,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "730944ca083c1c233a75c09f199e973ca499344a2b7ba9e755c457e86fb4a321"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4722,6 +4714,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "url"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5302,6 +5309,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.8",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "wepoll-ffi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5761,7 +5786,6 @@ dependencies = [
  "humantime",
  "insta",
  "interprocess",
- "isahc",
  "log",
  "miette",
  "names",
@@ -5837,7 +5861,6 @@ dependencies = [
  "highway",
  "insta",
  "interprocess",
- "isahc",
  "lazy_static",
  "libc",
  "log",
@@ -5855,6 +5878,7 @@ dependencies = [
  "tempfile",
  "typetag",
  "unicode-width 0.1.10",
+ "ureq",
  "url",
  "uuid",
  "vte 0.11.0",
@@ -5896,14 +5920,12 @@ dependencies = [
  "colored",
  "colorsys",
  "crossbeam",
- "curl-sys",
  "directories",
  "expect-test",
  "humantime",
  "include_dir",
  "insta",
  "interprocess",
- "isahc",
  "kdl",
  "lazy_static",
  "log",
@@ -5912,7 +5934,6 @@ dependencies = [
  "names",
  "nix 0.23.1",
  "notify",
- "openssl-sys",
  "percent-encoding",
  "prost",
  "prost-build",
@@ -5931,6 +5952,7 @@ dependencies = [
  "thiserror 1.0.61",
  "tokio",
  "unicode-width 0.1.10",
+ "ureq",
  "url",
  "uuid",
 ]
