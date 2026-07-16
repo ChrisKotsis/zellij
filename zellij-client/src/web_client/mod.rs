@@ -70,6 +70,17 @@ pub fn start_web_client(
     custom_server_cert: Option<PathBuf>,
     custom_server_key: Option<PathBuf>,
 ) {
+    // LOCAL PATCH (isahc removal, 2026-07-15): ureq brought a second rustls
+    // CryptoProvider (ring) into the dependency graph, so rustls 0.23 can no
+    // longer auto-select one — install aws-lc-rs (previously the sole
+    // provider) explicitly, or TLS setup fails at startup with "no
+    // process-level CryptoProvider available".
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        log::warn!("rustls CryptoProvider was already installed");
+    }
     std::panic::set_hook({
         Box::new(move |info| {
             let thread = thread::current();

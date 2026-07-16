@@ -5693,6 +5693,7 @@ dependencies = [
  "notify",
  "regex",
  "rmp-serde",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
