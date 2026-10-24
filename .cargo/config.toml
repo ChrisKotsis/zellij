@@ -1,5 +1,11 @@
 parallel-compiler = true
 
+# Every worktree of this fork shares one target dir on /data. The default
+# (<worktree>/target) lands on the root disk, which is 99% full with 13 lanes
+# sharing it: a fresh worktree built 4.1G there. /data has the room.
+[build]
+target-dir = "/data/scratch/zellij-target"
+
 [alias]
 xtask = "run --package xtask --"
 x = "xtask"
