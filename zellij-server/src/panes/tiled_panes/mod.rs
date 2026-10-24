@@ -590,7 +590,7 @@ impl TiledPanes {
                 }
             }
 
-            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).unwrap();
+            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
         }
         self.reset_boundaries();
     }
@@ -1283,7 +1283,7 @@ impl TiledPanes {
                 for pane_id in pane_ids_to_resize {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         let _ =
-                            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size);
+                            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
                     }
                 }
                 return true;
@@ -1313,7 +1313,7 @@ impl TiledPanes {
                 for pane_id in pane_ids_to_resize {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         let _ =
-                            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size);
+                            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
                     }
                 }
                 return true;
@@ -1343,7 +1343,7 @@ impl TiledPanes {
                 for pane_id in pane_ids_to_resize {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         let _ =
-                            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size);
+                            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
                     }
                 }
                 return true;
@@ -1373,7 +1373,7 @@ impl TiledPanes {
                 for pane_id in pane_ids_to_resize {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         let _ =
-                            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size);
+                            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
                     }
                 }
                 return true;
@@ -1586,7 +1586,7 @@ impl TiledPanes {
                     for pane_id in pane_ids_to_resize {
                         if let Some(pane) = self.panes.get_mut(&pane_id) {
                             resize_pty!(pane, self.os_api, self.senders, self.character_cell_size)
-                                .unwrap();
+                                .non_fatal();
                         }
                     }
                     self.reapply_pane_frames();
@@ -1679,7 +1679,7 @@ impl TiledPanes {
 
         for pane in self.panes.values_mut() {
             // TODO: only for the panes whose width/height actually changed
-            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).unwrap();
+            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
         }
         self.reset_boundaries();
         Ok(pane_size_changed)
@@ -1996,7 +1996,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             new_position.set_should_render(true);
 
             let current_position = self.panes.get_mut(&active_pane_id).unwrap();
@@ -2010,7 +2010,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             current_position.set_should_render(true);
             self.focus_pane_for_all_clients(active_pane_id);
             self.set_pane_frames(self.draw_pane_frames);
@@ -2062,7 +2062,7 @@ impl TiledPanes {
             self.senders,
             self.character_cell_size
         )
-        .unwrap();
+        .non_fatal();
         new_position.set_should_render(true);
 
         let current_position = self.panes.get_mut(&pane_id).unwrap();
@@ -2076,7 +2076,7 @@ impl TiledPanes {
             self.senders,
             self.character_cell_size
         )
-        .unwrap();
+        .non_fatal();
         current_position.set_should_render(true);
         self.reapply_pane_focus();
         self.set_pane_frames(self.draw_pane_frames);
@@ -2114,7 +2114,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             new_position.set_should_render(true);
 
             let current_position = self.panes.get_mut(&pane_id).unwrap();
@@ -2128,7 +2128,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             current_position.set_should_render(true);
             self.reapply_pane_focus();
             self.set_pane_frames(self.draw_pane_frames);
@@ -2165,7 +2165,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             new_position.set_should_render(true);
 
             let current_position = self.panes.get_mut(&pane_id).unwrap();
@@ -2179,7 +2179,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             current_position.set_should_render(true);
             self.reapply_pane_focus();
             self.set_pane_frames(self.draw_pane_frames);
@@ -2216,7 +2216,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             new_position.set_should_render(true);
 
             let current_position = self.panes.get_mut(&pane_id).unwrap();
@@ -2230,7 +2230,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             current_position.set_should_render(true);
             self.reapply_pane_focus();
             self.set_pane_frames(self.draw_pane_frames);
@@ -2269,7 +2269,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             new_position.set_should_render(true);
 
             let current_position = self.panes.get_mut(&pane_id).unwrap();
@@ -2283,7 +2283,7 @@ impl TiledPanes {
                 self.senders,
                 self.character_cell_size
             )
-            .unwrap();
+            .non_fatal();
             current_position.set_should_render(true);
             self.reapply_pane_focus();
             self.set_pane_frames(self.draw_pane_frames);

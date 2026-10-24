@@ -192,15 +192,21 @@ impl<T: Serialize> IpcSenderWithContext<T> {
     }
 
     /// Sends an event, along with the current [`ErrorContext`], on this [`IpcSenderWithContext`]'s socket.
+    ///
+    /// A failed write is RETURNED to the caller rather than logged here. A socket whose peer
+    /// has gone away fails on every message, and the one caller that keeps handing messages to
+    /// such a socket is the server's per-client forwarding thread: logging here cost it one
+    /// line per buffered message (zellient#22 — 42,708 of 44,710 lines in the live server log
+    /// were this single failure repeated). The error keeps this exact wording because that is
+    /// the string the log has always carried.
     pub fn send(&mut self, msg: T) -> Result<()> {
         let err_ctx = get_current_ctx();
         if rmp_serde::encode::write(&mut self.sender, &(msg, err_ctx)).is_err() {
             Err(anyhow!("failed to send message to client"))
         } else {
-            if let Err(e) = self.sender.flush() {
-                log::error!("Failed to flush ipc sender: {}", e);
-            }
-            Ok(())
+            self.sender
+                .flush()
+                .map_err(|e| anyhow!("Failed to flush ipc sender: {}", e))
         }
     }
 

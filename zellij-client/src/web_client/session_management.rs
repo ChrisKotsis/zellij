@@ -141,7 +141,7 @@ pub fn spawn_session_if_needed(
                     )
                 })?,
         };
-        Ok(spawn_new_session(
+        spawn_new_session(
             &session_name,
             os_input.clone(),
             config.clone(),
@@ -149,7 +149,7 @@ pub fn spawn_session_if_needed(
             layout,
             client_attributes,
             is_welcome_screen,
-        ))
+        )
     }
 }
 
@@ -161,7 +161,7 @@ fn spawn_new_session(
     layout: Layout,
     client_attributes: ClientAttributes,
     is_welcome_screen: bool,
-) -> (ClientToServerMsg, PathBuf) {
+) -> Result<(ClientToServerMsg, PathBuf), String> {
     let debug = false;
     envs::set_session_name(name.to_owned());
     os_input.update_session_name(name.to_owned());
@@ -174,7 +174,10 @@ fn spawn_new_session(
         sock_dir
     };
 
-    spawn_server(&*zellij_ipc_pipe, debug).unwrap();
+    // LOCAL PATCH (zellient#18): a server refuses a name that already has a live server; that
+    // fails THIS connection, never the shared web daemon.
+    spawn_server(&*zellij_ipc_pipe, debug)
+        .map_err(|e| format!("Failed to start a server for session {:?}: {}", name, e))?;
 
     let successfully_written_config = Config::write_config_to_disk_if_it_does_not_exist(
         config.to_string(true),
@@ -186,7 +189,7 @@ fn spawn_new_session(
     config.options.web_sharing = Some(WebSharing::On);
     let is_web_client = true;
 
-    (
+    Ok((
         ClientToServerMsg::NewClient(
             client_attributes,
             Box::new(cli_args),
@@ -199,7 +202,7 @@ fn spawn_new_session(
             is_welcome_screen,
         ),
         zellij_ipc_pipe,
-    )
+    ))
 }
 
 fn ipc_pipe_and_first_message_for_existing_session(

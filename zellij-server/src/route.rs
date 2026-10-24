@@ -1047,22 +1047,28 @@ pub(crate) fn route_thread_main(
                                 .to_anyhow()
                                 .with_context(err_context)?
                                 .set_client_size(client_id, new_size);
-                            session_state
+                            let min_size = session_state
                                 .read()
                                 .to_anyhow()
-                                .and_then(|state| {
-                                    state.min_client_terminal_size().ok_or(anyhow!(
-                                        "failed to determine minimal client terminal size"
-                                    ))
-                                })
-                                .and_then(|min_size| {
-                                    rlocked_sessions
-                                        .as_ref()
-                                        .context("couldn't get reference to read-locked session")?
-                                        .senders
-                                        .send_to_screen(ScreenInstruction::TerminalResize(min_size))
-                                })
-                                .with_context(err_context)?;
+                                .with_context(err_context)?
+                                .min_client_terminal_size();
+                            if let Some(min_size) = min_size {
+                                rlocked_sessions
+                                    .as_ref()
+                                    .context("no read-locked session")?
+                                    .senders
+                                    .send_to_screen(ScreenInstruction::TerminalResize(min_size))
+                                    .with_context(err_context)?;
+                            } else {
+                                // A resize from a client whose size is not registered yet
+                                // (the server's main loop has not yet run set_client_data
+                                // for this client). Log and drop — never panic the server.
+                                log::warn!(
+                                    "resize from client {:?} before its size was registered; \
+                                     skipping this frame",
+                                    client_id
+                                );
+                            }
                         },
                         ClientToServerMsg::TerminalPixelDimensions(pixel_dimensions) => {
                             send_to_screen_or_retry_queue!(
