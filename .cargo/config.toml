@@ -16,6 +16,19 @@ make = "xtask deprecated"
 # thread count: 4 of 4 runs red (2, 6, 2 and 6 failures); serially the same suite is green (3 of 3
 # runs at the base commit and after the queue waits, 538 passed / 108 ignored).
 #
+# RE-MEASURED 2026-10-24 in a worktree of the same base (efed38339), load average 79-102 on the 64
+# core box, so this is not an idle machine:
+#   * base form (105 fixed sleeps, no [env] section): 4 runs at the default thread count, 3 red (3,
+#     2 and 5 failures; the fourth run green) and 2, 0, 2 and 5 pending `.snap.new` files written,
+#     one of them the `disabled_mouse_hover_effect-2.snap.new` this row named;
+#   * with the queue waits, at the default thread count (ie. this setting): 5 of 5 runs green, 544
+#     passed / 0 failed / 108 ignored in 15-23s, no `.snap.new`, `git status --porcelain --
+#     zellij-server/src` empty after each;
+#   * with the queue waits, `--test-threads 64`: 3 of 3 runs red (1, 5 and 2 failures). The queue
+#     waits make a test's WAIT bounded; they do not make the frame COUNT independent of the
+#     scheduler, so serial is still what makes the suite deterministic. That residual is
+#     zellient#53 (a pump on the screen input channel plus re-recorded snapshots).
+#
 # This does not take the choice away from a developer or from CI: an already exported
 # RUST_TEST_THREADS, or an explicit `cargo test -- --test-threads N`, still wins over this value
 # (measured with cargo 1.84.0 on a probe crate: 4 tests of 300ms took 1.59s here, 0.37s with
