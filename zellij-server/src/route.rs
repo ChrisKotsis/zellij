@@ -965,10 +965,20 @@ pub(crate) fn route_thread_main(
                                               mut retry_queue: Option<
                     &mut VecDeque<ClientToServerMsg>,
                 >|
-                 -> Result<bool> {
+                 -> bool {
                     let mut should_break = false;
+                    // A read that fails is a lock poisoned by a thread that panicked elsewhere —
+                    // not a reason to end this router. Log it and serve this client's next
+                    // event: `?`ing it out of `route_loop` ends at this thread's `.fatal()`
+                    // spawn site (lib.rs), which panics every pane in the session.
                     let rlocked_sessions =
-                        session_data.read().to_anyhow().with_context(err_context)?;
+                        match session_data.read().to_anyhow().with_context(err_context) {
+                            Ok(rlocked_sessions) => rlocked_sessions,
+                            Err(err) => {
+                                Err::<(), _>(err).non_fatal();
+                                return false;
+                            },
+                        };
                     match instruction {
                         ClientToServerMsg::Key(key, raw_bytes, is_kitty_keyboard_protocol) => {
                             if let Some(rlocked_sessions) = rlocked_sessions.as_ref() {
@@ -983,7 +993,7 @@ pub(crate) fn route_thread_main(
                                                 is_kitty_keyboard_protocol,
                                             )
                                         {
-                                            if route_action(
+                                            match route_action(
                                                 action,
                                                 client_id,
                                                 None,
@@ -1001,8 +1011,11 @@ pub(crate) fn route_thread_main(
                                                     .default_mode
                                                     .unwrap_or(InputMode::Normal)
                                                     .clone(),
-                                            )? {
-                                                should_break = true;
+                                            ) {
+                                                Ok(break_loop) => should_break = break_loop,
+                                                // A failed route is a send to a thread that has
+                                                // exited: it costs this keypress, not the session.
+                                                Err(err) => Err::<(), _>(err).non_fatal(),
                                             }
                                         }
                                     },
@@ -1015,7 +1028,7 @@ pub(crate) fn route_thread_main(
                         ClientToServerMsg::Action(action, maybe_pane_id, maybe_client_id) => {
                             let client_id = maybe_client_id.unwrap_or(client_id);
                             if let Some(rlocked_sessions) = rlocked_sessions.as_ref() {
-                                if route_action(
+                                match route_action(
                                     action,
                                     client_id,
                                     maybe_pane_id.map(|p| PaneId::Terminal(p)),
@@ -1036,29 +1049,45 @@ pub(crate) fn route_thread_main(
                                         .default_mode
                                         .unwrap_or(InputMode::Normal)
                                         .clone(),
-                                )? {
-                                    should_break = true;
+                                ) {
+                                    Ok(break_loop) => should_break = break_loop,
+                                    // A failed route is a send to a thread that has exited: it
+                                    // costs this action, not the session.
+                                    Err(err) => Err::<(), _>(err).non_fatal(),
                                 }
                             }
                         },
                         ClientToServerMsg::TerminalResize(new_size) => {
-                            session_state
-                                .write()
-                                .to_anyhow()
-                                .with_context(err_context)?
-                                .set_client_size(client_id, new_size);
-                            let min_size = session_state
-                                .read()
-                                .to_anyhow()
-                                .with_context(err_context)?
-                                .min_client_terminal_size();
+                            match session_state.write().to_anyhow().with_context(err_context) {
+                                Ok(mut state) => state.set_client_size(client_id, new_size),
+                                Err(err) => {
+                                    Err::<(), _>(err).non_fatal();
+                                    return false;
+                                },
+                            }
+                            let min_size =
+                                match session_state.read().to_anyhow().with_context(err_context) {
+                                    Ok(state) => state.min_client_terminal_size(),
+                                    Err(err) => {
+                                        Err::<(), _>(err).non_fatal();
+                                        return false;
+                                    },
+                                };
                             if let Some(min_size) = min_size {
-                                rlocked_sessions
-                                    .as_ref()
-                                    .context("no read-locked session")?
-                                    .senders
-                                    .send_to_screen(ScreenInstruction::TerminalResize(min_size))
-                                    .with_context(err_context)?;
+                                match rlocked_sessions.as_ref() {
+                                    Some(rlocked_sessions) => rlocked_sessions
+                                        .senders
+                                        .send_to_screen(ScreenInstruction::TerminalResize(min_size))
+                                        .with_context(err_context)
+                                        .non_fatal(),
+                                    // A resize from a client whose session data is not published
+                                    // yet is routine on a fresh attach: log it and keep serving.
+                                    None => log::warn!(
+                                        "resize from client {:?} before the session data was \
+                                         published; skipping this frame",
+                                        client_id
+                                    ),
+                                }
                             } else {
                                 // A resize from a client whose size is not registered yet
                                 // (the server's main loop has not yet run set_client_data
@@ -1077,7 +1106,8 @@ pub(crate) fn route_thread_main(
                                 instruction,
                                 retry_queue
                             )
-                            .with_context(err_context)?;
+                            .with_context(err_context)
+                            .non_fatal();
                         },
                         ClientToServerMsg::BackgroundColor(ref background_color_instruction) => {
                             send_to_screen_or_retry_queue!(
@@ -1088,7 +1118,8 @@ pub(crate) fn route_thread_main(
                                 instruction,
                                 retry_queue
                             )
-                            .with_context(err_context)?;
+                            .with_context(err_context)
+                            .non_fatal();
                         },
                         ClientToServerMsg::ForegroundColor(ref foreground_color_instruction) => {
                             send_to_screen_or_retry_queue!(
@@ -1099,7 +1130,8 @@ pub(crate) fn route_thread_main(
                                 instruction,
                                 retry_queue
                             )
-                            .with_context(err_context)?;
+                            .with_context(err_context)
+                            .non_fatal();
                         },
                         ClientToServerMsg::ColorRegisters(ref color_registers) => {
                             send_to_screen_or_retry_queue!(
@@ -1108,7 +1140,8 @@ pub(crate) fn route_thread_main(
                                 instruction,
                                 retry_queue
                             )
-                            .with_context(err_context)?;
+                            .with_context(err_context)
+                            .non_fatal();
                         },
                         ClientToServerMsg::NewClient(
                             client_attributes,
@@ -1135,7 +1168,8 @@ pub(crate) fn route_thread_main(
                             );
                             to_server
                                 .send(new_client_instruction)
-                                .with_context(err_context)?;
+                                .with_context(err_context)
+                                .non_fatal();
                         },
                         ClientToServerMsg::AttachClient(
                             client_attributes,
@@ -1164,7 +1198,8 @@ pub(crate) fn route_thread_main(
                                 );
                                 to_server
                                     .send(attach_client_instruction)
-                                    .with_context(err_context)?;
+                                    .with_context(err_context)
+                                    .non_fatal();
                             } else {
                                 let error = "This session does not allow web connections.";
                                 let _ = to_server.send(ServerInstruction::LogError(
@@ -1179,12 +1214,13 @@ pub(crate) fn route_thread_main(
                             // we don't unwrap this because we don't really care if there's an error here (eg.
                             // if the main server thread exited before this router thread did)
                             let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
-                            return Ok(true);
+                            return true;
                         },
                         ClientToServerMsg::KillSession => {
                             to_server
                                 .send(ServerInstruction::KillSession)
-                                .with_context(err_context)?;
+                                .with_context(err_context)
+                                .non_fatal();
                         },
                         ClientToServerMsg::ConnStatus => {
                             let _ = to_server.send(ServerInstruction::ConnStatus(client_id));
@@ -1212,21 +1248,21 @@ pub(crate) fn route_thread_main(
                                 to_server.send(ServerInstruction::FailedToStartWebServer(error));
                         },
                     }
-                    Ok(should_break)
+                    should_break
                 };
                 let mut repeat_retries = VecDeque::new();
                 while let Some(instruction_to_retry) = retry_queue.pop_front() {
                     log::warn!("Server ready, retrying sending instruction.");
                     thread::sleep(Duration::from_millis(5));
                     let should_break =
-                        handle_instruction(instruction_to_retry, Some(&mut repeat_retries))?;
+                        handle_instruction(instruction_to_retry, Some(&mut repeat_retries));
                     if should_break {
                         break 'route_loop;
                     }
                 }
                 // retry on loop around
                 retry_queue.append(&mut repeat_retries);
-                let should_break = handle_instruction(instruction, Some(&mut retry_queue))?;
+                let should_break = handle_instruction(instruction, Some(&mut retry_queue));
                 if should_break {
                     break 'route_loop;
                 }
