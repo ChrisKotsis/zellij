@@ -20,7 +20,7 @@ use axum::{
 };
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
-use zellij_utils::{input::mouse::MouseEvent, ipc::ClientToServerMsg};
+use zellij_utils::{input::mouse::MouseEvent, ipc::ClientToServerMsg, pane_size::Size};
 
 pub async fn ws_handler_control(
     ws: WebSocketUpgrade,
@@ -170,6 +170,19 @@ async fn handle_ws_terminal(
             .unwrap()
             .set_client_session(&web_client_id, sname.clone());
     }
+    // LOCAL PATCH (llmos#16153): a client that states its grid on the attach is
+    // registered at it, so its first screen fits it.
+    if let (Some(cols), Some(rows)) = (params.cols, params.rows) {
+        if cols > 0 && rows > 0 {
+            state.connection_table.lock().unwrap().state_client_size(
+                &web_client_id,
+                Size {
+                    rows: rows as usize,
+                    cols: cols as usize,
+                },
+            );
+        }
+    }
 
     // LOCAL PATCH (web session ownership, llmos#15114): whether this socket may
     // CREATE the session it names. A named request is attach-only unless it
@@ -247,11 +260,12 @@ async fn handle_ws_terminal(
                 );
             },
             Message::Close(_) => {
-                state
+                let resizes = state
                     .connection_table
                     .lock()
                     .unwrap()
                     .remove_client(&web_client_id);
+                send_resizes(resizes);
                 break;
             },
             _ => {

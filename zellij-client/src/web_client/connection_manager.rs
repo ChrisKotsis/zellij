@@ -59,16 +59,46 @@ impl ConnectionTable {
             .and_then(|c| c.control_channel_tx.clone())
     }
 
-    pub fn remove_client(&mut self, client_id: &str) {
+    /// The client is gone. Returns the resizes to send (with the table's lock
+    /// released): when it owned a session's size, every other web client of that
+    /// session is registered at ITS OWN reported size again.
+    ///
+    /// LOCAL PATCH (llmos#16165): the others had been re-registered at the owner's
+    /// size, and nothing gave them their own back when the owner left. MEASURED
+    /// 2026-11-12: a 60x20 client kept receiving screens addressed to row 50,
+    /// column 200 after the 200x50 owner had closed both sockets - a screen larger
+    /// than its grid, which it draws as an incoherent scroll.
+    pub fn remove_client(&mut self, client_id: &str) -> Vec<Resize> {
         if let Some(mut client_channels) = self.client_id_to_channels.remove(client_id).take() {
             client_channels.cleanup();
         }
         self.client_id_to_session.remove(client_id);
         self.client_size.remove(client_id);
-        // If this client owned a session's size, release ownership: the next
-        // client to type takes it.
+        let owned: Vec<String> = self
+            .session_size_owner
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == client_id)
+            .map(|(session, _)| session.clone())
+            .collect();
+        // Release ownership: the next client to type (or claim) takes it.
         self.session_size_owner
             .retain(|_, owner| owner.as_str() != client_id);
+        let mut out = vec![];
+        for session in owned {
+            for other in self.others_in_session(&session, client_id) {
+                if let Some(own) = self.client_size.get(&other).copied() {
+                    out.extend(self.resize_for(&other, own));
+                }
+            }
+        }
+        out
+    }
+
+    /// The size a client stated when it opened its terminal socket (llmos#16153).
+    /// Recorded like a reported size, before the session server is told anything,
+    /// so `attach_size` can register the client at its own grid.
+    pub fn state_client_size(&mut self, client_id: &str, size: Size) {
+        self.client_size.insert(client_id.to_owned(), size);
     }
 
     pub fn set_client_session(&mut self, client_id: &str, session_name: String) {
@@ -92,15 +122,17 @@ impl ConnectionTable {
     // clamp.
 
     /// The size a web client registers with when it attaches: the size owner's,
-    /// else the size its session last took from a web client, else NO_CLAMP_SIZE.
-    /// Never the fd0 fallback, which is how a silent attacher clamped everyone.
+    /// else the size the client stated on its attach (llmos#16153), else the size
+    /// its session last took from a web client, else NO_CLAMP_SIZE. Never the fd0
+    /// fallback, which is how a silent attacher clamped everyone.
     pub fn attach_size(&self, client_id: &str) -> Size {
         let Some(session) = self.client_id_to_session.get(client_id) else {
-            return NO_CLAMP_SIZE;
+            return self.client_size.get(client_id).copied().unwrap_or(NO_CLAMP_SIZE);
         };
         self.session_size_owner
             .get(session)
             .and_then(|owner| self.client_size.get(owner))
+            .or_else(|| self.client_size.get(client_id))
             .or_else(|| self.session_size.get(session))
             .copied()
             .unwrap_or(NO_CLAMP_SIZE)
@@ -257,10 +289,12 @@ impl ClientConnectionBus {
                 }
             },
         }
-        self.connection_table
+        let resizes = self
+            .connection_table
             .lock()
             .unwrap()
             .remove_client(&self.web_client_id);
+        send_resizes(resizes);
     }
 
     fn get_control_channel_tx(&mut self) {

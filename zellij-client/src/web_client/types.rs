@@ -239,6 +239,12 @@ pub struct TerminalParams {
     // see `session_creation_policy`. Kept as a string so `1`/`true` both parse
     // (a bool field would reject `1` with a 400 before this code runs).
     pub create: Option<String>,
+    // LOCAL PATCH (llmos#16153): the client's own grid, stated on the attach
+    // (`&cols=..&rows=..`), so the first screen is drawn at the client's size and
+    // not at NO_CLAMP_SIZE (2000x500: 1,098,004 bytes in one message, measured
+    // 2026-11-12, which a client with a 1 MiB message limit cannot receive).
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
 }
 
 #[derive(Deserialize)]

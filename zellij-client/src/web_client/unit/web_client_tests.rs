@@ -2078,6 +2078,62 @@ mod session_size_follows_the_active_client {
         assert!(!t.on_terminal_resize("other", SMALL).is_empty(), "no owner: it registers again");
     }
 
+    /// llmos#16165 (MEASURED 2026-11-12): after the owner left, a smaller client kept
+    /// receiving screens drawn for the owner's size, which it shows as an incoherent
+    /// scroll. Every other client of the session gets its own size back.
+    #[test]
+    fn the_owner_leaving_gives_every_other_client_its_own_size_back() {
+        let (mut t, mocks) = table_with(&["owner", "small", "mid"]);
+        let mid = Size { rows: 40, cols: 120 };
+        send_resizes(t.on_terminal_resize("owner", BIG));
+        send_resizes(t.on_terminal_resize("small", SMALL));
+        send_resizes(t.on_terminal_resize("mid", mid));
+        send_resizes(t.on_user_input("owner"));
+        assert_eq!(registered(&mocks[1]).last(), Some(&BIG), "small mirrors the owner");
+        assert_eq!(registered(&mocks[2]).last(), Some(&BIG), "mid mirrors the owner");
+
+        send_resizes(t.remove_client("owner"));
+        assert_eq!(registered(&mocks[1]).last(), Some(&SMALL), "small has its own size again");
+        assert_eq!(registered(&mocks[2]).last(), Some(&mid), "mid has its own size again");
+        assert!(t.session_size_owner.is_empty());
+    }
+
+    #[test]
+    fn a_client_that_was_not_the_owner_leaving_changes_nobody() {
+        let (mut t, mocks) = table_with(&["owner", "other", "leaver"]);
+        send_resizes(t.on_terminal_resize("owner", BIG));
+        send_resizes(t.on_terminal_resize("other", SMALL));
+        send_resizes(t.on_terminal_resize("leaver", SMALL));
+        send_resizes(t.on_user_input("owner"));
+        let before = registered(&mocks[1]).len();
+        assert!(t.remove_client("leaver").is_empty());
+        assert_eq!(registered(&mocks[1]).len(), before);
+        assert_eq!(t.session_size_owner.get("s").map(String::as_str), Some("owner"));
+    }
+
+    /// llmos#16153: a client that states its grid on the attach registers at it,
+    /// instead of at NO_CLAMP_SIZE (whose first screen was 1,098,004 bytes) or at a
+    /// size the session last took from another client. An owner's size still wins.
+    #[test]
+    fn a_client_that_states_its_size_on_attach_registers_at_it() {
+        let (mut t, _) = table_with(&["first"]);
+        t.set_client_session("phone", "s".to_string());
+        t.state_client_size("phone", SMALL);
+        assert_eq!(t.attach_size("phone"), SMALL, "no owner: the stated size, not NO_CLAMP_SIZE");
+
+        send_resizes(t.on_terminal_resize("first", BIG));
+        t.set_client_session("late", "s".to_string());
+        t.state_client_size("late", SMALL);
+        assert_eq!(t.attach_size("late"), SMALL, "its own size beats the session's last size");
+
+        send_resizes(t.on_user_input("first"));
+        assert_eq!(t.attach_size("late"), BIG, "while a client owns the session, it mirrors the owner");
+
+        let mut lone = ConnectionTable::default();
+        lone.state_client_size("solo", SMALL);
+        assert_eq!(lone.attach_size("solo"), SMALL, "a stated size counts before the session is known");
+    }
+
     #[test]
     fn only_the_user_acting_counts_as_activity() {
         for key in [&b"a"[..], b"\r", b"\x1b[A", b"\x1b[15~", b"\x1b[97;5u", b"\x1b[<0;10;5M",
