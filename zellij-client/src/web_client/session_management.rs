@@ -113,6 +113,21 @@ pub fn session_creation_policy(
     }
 }
 
+/// The creation policy for ONE pass of a terminal socket's connect loop.
+///
+/// LOCAL PATCH (web session ownership, llmos#15114). The first pass carries the
+/// policy of the request that opened the socket (`Some`). Every later pass
+/// (`None`) follows a `SwitchSession` sent by the session the socket is
+/// attached to: a person at that terminal used zellij's session manager or the
+/// welcome screen to open another session. That is an explicit request made
+/// from inside a live session, and the server forwards the target name without
+/// checking that it runs, so the pass may create. It is not the stale-tab case
+/// the attach-only rule exists for: nothing sends `SwitchSession` on behalf of a
+/// session that has ended.
+pub fn policy_for_pass(request_policy: Option<SessionCreationPolicy>) -> SessionCreationPolicy {
+    request_policy.unwrap_or(SessionCreationPolicy::CreateIfMissing)
+}
+
 /// A session name the orchestrator owns. Every lane runs in
 /// `work-<digits>-<hex>`, is minted by the orchestrator (`zellij attach
 /// --create-background`) and is reaped by `zellij_session_janitor` when its

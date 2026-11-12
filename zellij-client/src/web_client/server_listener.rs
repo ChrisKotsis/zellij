@@ -1,6 +1,6 @@
 use crate::os_input_output::ClientOsApi;
 use crate::web_client::control_message::WebServerToWebClientControlMessage;
-use crate::web_client::session_management::build_initial_connection;
+use crate::web_client::session_management::{build_initial_connection, policy_for_pass};
 use crate::web_client::types::{
     ClientConnectionBus, ConnectionTable, SessionCreationPolicy, SessionManager,
 };
@@ -44,15 +44,19 @@ pub fn zellij_server_listener(
                             return;
                         },
                     };
-                // LOCAL PATCH (web session ownership, llmos#15114): the policy
-                // belongs to the request that OPENED this socket. A reconnect
-                // after a server-driven SwitchSession names a session the server
-                // itself vouched for, so it may never create.
-                let mut create_policy = Some(create_policy);
+                // LOCAL PATCH (web session ownership, llmos#15114): the request
+                // that OPENED this socket decides the FIRST pass only. A later
+                // pass happens when the session this socket is attached to sent
+                // SwitchSession: zellij's own session manager or welcome screen,
+                // driven by the person at that terminal ("new session",
+                // "resurrect"). The server forwards that name WITHOUT checking
+                // that it runs (zellij-server lib.rs, SwitchSession), so that
+                // pass has to be able to create, or the welcome screen of an
+                // unnamed request is a dead end. A lane's name is refused on
+                // every pass by `decide_session_action`.
+                let mut request_policy = Some(create_policy);
                 'reconnect_loop: loop {
-                    let this_create_policy = create_policy
-                        .take()
-                        .unwrap_or(SessionCreationPolicy::AttachOnly);
+                    let this_create_policy = policy_for_pass(request_policy.take());
                     let reconnect_info = reconnect_to_session.take();
                     let path = {
                         let Some(session_name) = reconnect_info

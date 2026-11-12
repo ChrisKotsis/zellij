@@ -492,7 +492,17 @@ mod web_client_tests {
     async fn start_web_server_with(
         session_manager: Arc<MockSessionManager>,
     ) -> (u16, tokio::task::JoinHandle<()>) {
-        let client_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+        start_web_server_with_factory(session_manager, Arc::new(MockClientOsApiFactory::new()))
+            .await
+    }
+
+    /// The same server, over a client OS API factory the test supplies: a factory
+    /// with scripted server messages lets a test play what an attached session
+    /// sends its client (a `SwitchSession`) without forking a zellij server.
+    async fn start_web_server_with_factory(
+        session_manager: Arc<MockSessionManager>,
+        client_os_api_factory: Arc<MockClientOsApiFactory>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
         let config = Config::default();
         let options = Options::default();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -742,6 +752,161 @@ mod web_client_tests {
             session_manager_for_verification.spawn_attempts().len(),
             1,
             "an unnamed request must still create the terminal session"
+        );
+
+        server_handle.abort();
+        revoke_token(test_token_name).expect("Failed to revoke test token");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// A `SwitchSession` naming `target`, as the session a web client is attached
+    /// to sends it when the person there opens another session from zellij's
+    /// session manager or welcome screen. The server forwards the name without
+    /// checking that it runs (zellij-server lib.rs).
+    fn switch_to(target: &str) -> ServerToClientMsg {
+        ServerToClientMsg::SwitchSession(zellij_utils::data::ConnectToSession {
+            name: Some(target.to_owned()),
+            ..Default::default()
+        })
+    }
+
+    /// The attach-only rule is about a name a BROWSER remembers. A person who
+    /// creates a session from zellij's session manager INSIDE a live session they
+    /// are attached to asked for it explicitly: the web client must create it,
+    /// exactly as before the rule (llmos#15114 follow-up, 2026-11-11). Without
+    /// this the socket reads "Session ... is not available" and the pane is dead.
+    #[tokio::test]
+    #[serial]
+    async fn test_a_switch_asked_for_inside_a_live_session_creates_the_session_it_names() {
+        isolate_token_db();
+        let _ = delete_db();
+
+        let test_token_name = "test_token_switch_inside_live_creates";
+        let (auth_token, _) =
+            create_token(Some(test_token_name.to_string())).expect("Failed to create test token");
+
+        let live = "a-live-session";
+        let picked = "picked-in-the-session-manager";
+        let mut session_manager = MockSessionManager::new();
+        session_manager.mock_sessions.insert(live.to_owned(), true);
+        let session_manager = Arc::new(session_manager);
+        let session_manager_for_verification = session_manager.clone();
+        let factory = Arc::new(MockClientOsApiFactory::with_scripted_server_messages(vec![
+            switch_to(picked),
+        ]));
+        let (port, server_handle) = start_web_server_with_factory(session_manager, factory).await;
+
+        let session_token = login_and_get_session_token(port, &auth_token).await;
+        let web_client_id = create_client_session(port, &session_token).await;
+
+        // A plain named attach (attach-only) to the LIVE session; that session then
+        // sends the switch.
+        let message =
+            first_terminal_message(port, &session_token, &web_client_id, Some(live), false).await;
+        assert!(
+            message.is_none(),
+            "a switch asked for from inside a live session must not be refused, got: {:?}",
+            message
+        );
+        assert_eq!(
+            session_manager_for_verification.spawn_attempts(),
+            vec![(picked.to_owned(), SessionCreationPolicy::CreateIfMissing)],
+            "attaching to the live session creates nothing; the switch creates exactly the session it names"
+        );
+
+        server_handle.abort();
+        revoke_token(test_token_name).expect("Failed to revoke test token");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// The same switch can never bring a LANE back: `work-*` names are refused on
+    /// every pass, whatever asked.
+    #[tokio::test]
+    #[serial]
+    async fn test_a_switch_never_creates_an_orchestrator_owned_session() {
+        isolate_token_db();
+        let _ = delete_db();
+
+        let test_token_name = "test_token_switch_never_creates_a_lane";
+        let (auth_token, _) =
+            create_token(Some(test_token_name.to_string())).expect("Failed to create test token");
+
+        let live = "a-live-session";
+        let lane = "work-1793998170-e39f063d";
+        let mut session_manager = MockSessionManager::new();
+        session_manager.mock_sessions.insert(live.to_owned(), true);
+        let session_manager = Arc::new(session_manager);
+        let session_manager_for_verification = session_manager.clone();
+        let factory = Arc::new(MockClientOsApiFactory::with_scripted_server_messages(vec![
+            switch_to(lane),
+        ]));
+        let (port, server_handle) = start_web_server_with_factory(session_manager, factory).await;
+
+        let session_token = login_and_get_session_token(port, &auth_token).await;
+        let web_client_id = create_client_session(port, &session_token).await;
+
+        let message =
+            first_terminal_message(port, &session_token, &web_client_id, Some(live), false).await;
+        let message = message
+            .expect("a switch to a lane that is not running must be refused in the terminal");
+        assert!(
+            message.contains("is not available") && message.contains("orchestrator-owned"),
+            "the refusal must say why, got: {:?}",
+            message
+        );
+        assert!(
+            session_manager_for_verification.spawn_attempts().is_empty(),
+            "nothing may be created for a lane's name, got: {:?}",
+            session_manager_for_verification.spawn_attempts()
+        );
+
+        server_handle.abort();
+        revoke_token(test_token_name).expect("Failed to revoke test token");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// An unnamed request opens the welcome screen, and the session the person
+    /// picks there arrives as a `SwitchSession`. The welcome screen must not be a
+    /// dead end: that session is created.
+    #[tokio::test]
+    #[serial]
+    async fn test_the_session_picked_on_the_welcome_screen_is_created() {
+        isolate_token_db();
+        let _ = delete_db();
+
+        let test_token_name = "test_token_welcome_screen_pick_creates";
+        let (auth_token, _) =
+            create_token(Some(test_token_name.to_string())).expect("Failed to create test token");
+
+        let picked = "picked-on-the-welcome-screen";
+        let session_manager = Arc::new(MockSessionManager::new());
+        let session_manager_for_verification = session_manager.clone();
+        let factory = Arc::new(MockClientOsApiFactory::with_scripted_server_messages(vec![
+            switch_to(picked),
+        ]));
+        let (port, server_handle) = start_web_server_with_factory(session_manager, factory).await;
+
+        let session_token = login_and_get_session_token(port, &auth_token).await;
+        let web_client_id = create_client_session(port, &session_token).await;
+
+        let message =
+            first_terminal_message(port, &session_token, &web_client_id, None, false).await;
+        assert!(
+            message.is_none(),
+            "the welcome screen's pick must not be refused, got: {:?}",
+            message
+        );
+        let attempts = session_manager_for_verification.spawn_attempts();
+        assert_eq!(
+            attempts.len(),
+            2,
+            "the welcome-screen session and the picked session, got: {:?}",
+            attempts
+        );
+        assert_eq!(
+            attempts[1],
+            (picked.to_owned(), SessionCreationPolicy::CreateIfMissing),
+            "the second session created is the one the person picked"
         );
 
         server_handle.abort();
@@ -1629,12 +1794,21 @@ impl SessionManager for MockSessionManager {
 #[derive(Debug, Clone)]
 struct MockClientOsApiFactory {
     mock_apis: Arc<Mutex<HashMap<String, Arc<MockClientOsApi>>>>,
+    /// What the session a new client attaches to sends it, in order (llmos#15114:
+    /// a `SwitchSession` here stands for a person using zellij's session manager
+    /// inside that session). Empty for every test that does not script one.
+    scripted_from_server: Vec<ServerToClientMsg>,
 }
 
 impl MockClientOsApiFactory {
     fn new() -> Self {
+        Self::with_scripted_server_messages(Vec::new())
+    }
+
+    fn with_scripted_server_messages(scripted_from_server: Vec<ServerToClientMsg>) -> Self {
         Self {
             mock_apis: Arc::new(Mutex::new(HashMap::new())),
+            scripted_from_server,
         }
     }
 }
@@ -1642,6 +1816,13 @@ impl MockClientOsApiFactory {
 impl ClientOsApiFactory for MockClientOsApiFactory {
     fn create_client_os_api(&self) -> Result<Box<dyn ClientOsApi>, Box<dyn std::error::Error>> {
         let mock_api = Arc::new(MockClientOsApi::new());
+        for message in &self.scripted_from_server {
+            mock_api
+                .messages_from_server
+                .lock()
+                .unwrap()
+                .push_back((message.clone(), ErrorContext::new()));
+        }
 
         let client_id = uuid::Uuid::new_v4().to_string();
         self.mock_apis
@@ -1915,13 +2096,33 @@ mod session_size_follows_the_active_client {
 /// (live?, policy, name) into attach / create / refuse.
 mod web_session_ownership_tests {
     use crate::web_client::session_management::{
-        decide_session_action, is_orchestrator_owned_session_name, session_creation_policy,
-        SessionAction,
+        decide_session_action, is_orchestrator_owned_session_name, policy_for_pass,
+        session_creation_policy, SessionAction,
     };
     use crate::web_client::types::SessionCreationPolicy;
     use crate::web_client::utils::parse_create_flag;
 
     const LANE: &str = "work-1793998170-e39f063d";
+
+    #[test]
+    fn the_first_pass_carries_the_requests_policy_and_a_switch_may_create() {
+        // The request that opened the socket decides the first pass, whatever it says.
+        assert_eq!(
+            policy_for_pass(Some(SessionCreationPolicy::AttachOnly)),
+            SessionCreationPolicy::AttachOnly
+        );
+        assert_eq!(
+            policy_for_pass(Some(SessionCreationPolicy::CreateIfMissing)),
+            SessionCreationPolicy::CreateIfMissing
+        );
+        // A later pass follows a SwitchSession sent from inside a live session.
+        assert_eq!(
+            policy_for_pass(None),
+            SessionCreationPolicy::CreateIfMissing
+        );
+        // ... and a lane's name is still refused there.
+        assert!(decide_session_action(LANE, false, policy_for_pass(None)).is_err());
+    }
 
     #[test]
     fn unnamed_request_may_create_a_session() {
