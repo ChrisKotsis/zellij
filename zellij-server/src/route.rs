@@ -1012,7 +1012,11 @@ pub(crate) fn route_thread_main(
                                                     .unwrap_or(InputMode::Normal)
                                                     .clone(),
                                             ) {
-                                                Ok(break_loop) => should_break = break_loop,
+                                                // Sticky: a key can be bound to several
+                                                // actions, and once ONE of them ends this
+                                                // client's router (Detach, Quit) a later one
+                                                // must not un-end it.
+                                                Ok(break_loop) => should_break |= break_loop,
                                                 // A failed route is a send to a thread that has
                                                 // exited: it costs this keypress, not the session.
                                                 Err(err) => Err::<(), _>(err).non_fatal(),
@@ -1050,7 +1054,7 @@ pub(crate) fn route_thread_main(
                                         .unwrap_or(InputMode::Normal)
                                         .clone(),
                                 ) {
-                                    Ok(break_loop) => should_break = break_loop,
+                                    Ok(break_loop) => should_break |= break_loop,
                                     // A failed route is a send to a thread that has exited: it
                                     // costs this action, not the session.
                                     Err(err) => Err::<(), _>(err).non_fatal(),
