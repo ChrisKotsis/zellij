@@ -914,6 +914,197 @@ mod web_client_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    type ClientSocket =
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    /// The sizes the session server was told for each client connection, in order.
+    fn registered_sizes(factory: &MockClientOsApiFactory) -> Vec<Vec<Size>> {
+        factory
+            .mock_apis
+            .lock()
+            .unwrap()
+            .values()
+            .map(|mock| {
+                mock.get_sent_messages()
+                    .into_iter()
+                    .filter_map(|m| match m {
+                        ClientToServerMsg::TerminalResize(size) => Some(size),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Open a client's control socket and report `size` on it, as a real client
+    /// does first. Returns once the web server has registered that size (so the
+    /// client's control channel is known to it too).
+    async fn open_control_and_report_size(
+        port: u16,
+        session_token: &str,
+        web_client_id: &str,
+        size: Size,
+        factory: &MockClientOsApiFactory,
+    ) -> ClientSocket {
+        let control_ws_url = format!("ws://127.0.0.1:{}/ws/control", port);
+        let (mut control, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&control_ws_url, session_token),
+        )
+        .await
+        .expect("Control WebSocket connection timed out")
+        .expect("Failed to connect to control WebSocket");
+        let resize = WebClientToWebServerControlMessage {
+            web_client_id: web_client_id.to_owned(),
+            payload: WebClientToWebServerControlMessagePayload::TerminalResize(size),
+        };
+        control
+            .send(Message::Text(serde_json::to_string(&resize).unwrap()))
+            .await
+            .expect("Failed to send resize message");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !registered_sizes(factory).contains(&vec![size]) {
+            assert!(Instant::now() < deadline, "the reported size {:?} was never registered", size);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        control
+    }
+
+    /// Read a client's control stream until the listener tells it that its
+    /// session is now called `name`.
+    async fn wait_for_session_name(control: &mut ClientSocket, name: &str) {
+        let told = timeout(Duration::from_secs(10), async {
+            while let Some(Ok(message)) = control.next().await {
+                if let Message::Text(text) = message {
+                    if let Ok(WebServerToWebClientControlMessage::SwitchedSession {
+                        new_session_name,
+                    }) = serde_json::from_str(&text)
+                    {
+                        if new_session_name == name {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(told, Ok(true), "the client was never told its session is {:?}", name);
+    }
+
+    /// ZELLIENT#112 through the real listener and the real sockets (MEASURED
+    /// 2026-11-13: a session renamed `ats` -> `LLMOS-R1` ignored every Ctrl+0 from
+    /// the device that attached after the rename). Client A attaches to a session,
+    /// the session is renamed, client B attaches under the new name and claims the
+    /// size: A's own server connection must be registered at B's size, or the
+    /// session server keeps rendering at the minimum of the two.
+    #[tokio::test]
+    #[serial]
+    async fn test_a_claim_reaches_the_client_that_attached_before_its_session_was_renamed() {
+        isolate_token_db();
+        let _ = delete_db();
+
+        let test_token_name = "test_token_claim_after_rename";
+        let (auth_token, _) =
+            create_token(Some(test_token_name.to_string())).expect("Failed to create test token");
+
+        let name_at_attach = "named-at-attach";
+        let renamed_to = "renamed-later";
+        let mut session_manager = MockSessionManager::new();
+        session_manager
+            .mock_sessions
+            .insert(name_at_attach.to_owned(), true);
+        session_manager
+            .mock_sessions
+            .insert(renamed_to.to_owned(), true);
+        // The session tells every client attached to it of the rename. (The mock
+        // plays the same script to each client: for B, which attaches under the
+        // new name, it is a rename it already knows.)
+        let factory = Arc::new(MockClientOsApiFactory::with_scripted_server_messages(vec![
+            ServerToClientMsg::RenamedSession(renamed_to.to_owned()),
+        ]));
+        let factory_for_verification = factory.clone();
+        let (port, server_handle) =
+            start_web_server_with_factory(Arc::new(session_manager), factory).await;
+        let session_token = login_and_get_session_token(port, &auth_token).await;
+
+        let size_of_a = Size { rows: 49, cols: 76 };
+        let size_of_b = Size { rows: 62, cols: 81 };
+        let terminal_url = |session: &str, web_client_id: &str| {
+            format!(
+                "ws://127.0.0.1:{}/ws/terminal/{}?web_client_id={}",
+                port, session, web_client_id
+            )
+        };
+
+        // A attaches while the session has its first name, and is told of the rename.
+        let a = create_client_session(port, &session_token).await;
+        let mut a_control = open_control_and_report_size(
+            port,
+            &session_token,
+            &a,
+            size_of_a,
+            &factory_for_verification,
+        )
+        .await;
+        let (_a_terminal, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_url(name_at_attach, &a), &session_token),
+        )
+        .await
+        .expect("Terminal WebSocket connection timed out")
+        .expect("Failed to connect to terminal WebSocket");
+        wait_for_session_name(&mut a_control, renamed_to).await;
+
+        // B attaches under the new name, and claims the session's size (Ctrl+0).
+        let b = create_client_session(port, &session_token).await;
+        let mut b_control = open_control_and_report_size(
+            port,
+            &session_token,
+            &b,
+            size_of_b,
+            &factory_for_verification,
+        )
+        .await;
+        let (_b_terminal, _) = timeout(
+            Duration::from_secs(5),
+            connect_async_with_cookie(&terminal_url(renamed_to, &b), &session_token),
+        )
+        .await
+        .expect("Terminal WebSocket connection timed out")
+        .expect("Failed to connect to terminal WebSocket");
+        wait_for_session_name(&mut b_control, renamed_to).await;
+        let claim = WebClientToWebServerControlMessage {
+            web_client_id: b.clone(),
+            payload: WebClientToWebServerControlMessagePayload::DetachOtherClients,
+        };
+        b_control
+            .send(Message::Text(serde_json::to_string(&claim).unwrap()))
+            .await
+            .expect("Failed to send the claim");
+
+        // A's connection is the one whose first registered size is A's own.
+        let registered_for_a = || -> Vec<Size> {
+            registered_sizes(&factory_for_verification)
+                .into_iter()
+                .find(|sizes| sizes.first() == Some(&size_of_a))
+                .expect("A reported its size, so one connection starts with it")
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while registered_for_a().last() != Some(&size_of_b) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            registered_for_a(),
+            vec![size_of_a, size_of_b],
+            "B's claim must register A, which attached before the rename, at B's size"
+        );
+
+        server_handle.abort();
+        revoke_token(test_token_name).expect("Failed to revoke test token");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_unauthorized_access_without_session() {

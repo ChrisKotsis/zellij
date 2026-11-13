@@ -1,4 +1,5 @@
 use crate::os_input_output::ClientOsApi;
+use crate::web_client::connection_manager::send_resizes;
 use crate::web_client::control_message::WebServerToWebClientControlMessage;
 use crate::web_client::session_management::{build_initial_connection, policy_for_pass};
 use crate::web_client::types::{
@@ -199,6 +200,17 @@ pub fn zellij_server_listener(
                                 );
                             },
                             Some((ServerToClientMsg::RenamedSession(new_session_name), _)) => {
+                                // LOCAL PATCH (zellient#112): the connection table
+                                // files this client, its session's size owner and
+                                // last size under the session's NAME. A rename that
+                                // only reached the browser left a client attached
+                                // before it and one attached after it in two
+                                // "sessions", and a size claim reached nobody.
+                                let resizes = connection_table
+                                    .lock()
+                                    .unwrap()
+                                    .rename_session(&web_client_id, &new_session_name);
+                                send_resizes(resizes);
                                 client_connection_bus.send_control(
                                     WebServerToWebClientControlMessage::SwitchedSession {
                                         new_session_name,
