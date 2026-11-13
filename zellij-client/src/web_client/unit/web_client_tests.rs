@@ -2134,6 +2134,166 @@ mod session_size_follows_the_active_client {
         assert_eq!(lone.attach_size("solo"), SMALL, "a stated size counts before the session is known");
     }
 
+    // ZELLIENT#112: A RENAMED SESSION IS STILL ONE SESSION. The table files clients, the size
+    // owner and the last size under the session's NAME. MEASURED 2026-11-13: a session renamed
+    // `ats` -> `LLMOS-R1` had one web client filed under each name (the Windows pane attached
+    // before the rename, the MacBook after it), every claim from the MacBook logged "0 other web
+    // client(s) re-registered at its size", and the session stayed at the idle pane's 76x49.
+
+    /// The idle pane that attached before the rename, and the device in use that attached
+    /// after it (the sizes of the measured case).
+    const BEFORE: Size = Size { rows: 49, cols: 76 };
+    const AFTER: Size = Size { rows: 62, cols: 81 };
+
+    /// A web client attaches to `session` and reports its size, as a real one does.
+    fn attach(t: &mut ConnectionTable, id: &str, session: &str, size: Size) -> MockClientOsApi {
+        let mock = MockClientOsApi::new();
+        t.add_new_client(id.to_string(), Box::new(mock.clone()));
+        t.set_client_session(id, session.to_string());
+        send_resizes(t.on_terminal_resize(id, size));
+        mock
+    }
+
+    /// Everything the table files under a session's name.
+    fn filed_under(t: &ConnectionTable, session: &str) -> (Vec<String>, Option<String>, Option<Size>) {
+        let mut clients: Vec<String> = t
+            .client_id_to_session
+            .iter()
+            .filter(|(_, s)| s.as_str() == session)
+            .map(|(id, _)| id.clone())
+            .collect();
+        clients.sort();
+        (
+            clients,
+            t.session_size_owner.get(session).cloned(),
+            t.session_size.get(session).copied(),
+        )
+    }
+
+    #[test]
+    fn a_claim_after_a_rename_resizes_the_client_that_attached_before_it() {
+        let mut t = ConnectionTable::default();
+        let a = attach(&mut t, "a", "old", BEFORE);
+        send_resizes(t.rename_session("a", "new"));
+        let b = attach(&mut t, "b", "new", AFTER);
+
+        let (others, resizes) = t.claim_session_size_owner("b");
+        assert_eq!(others, 1, "the client that attached before the rename is in the same session");
+        send_resizes(resizes);
+        assert_eq!(registered(&a).last(), Some(&AFTER), "A must mirror the claimer");
+        assert_eq!(registered(&b).last(), Some(&AFTER));
+    }
+
+    #[test]
+    fn the_claimer_leaving_a_renamed_session_gives_the_earlier_client_its_own_size_back() {
+        let mut t = ConnectionTable::default();
+        let a = attach(&mut t, "a", "old", BEFORE);
+        send_resizes(t.rename_session("a", "new"));
+        let _b = attach(&mut t, "b", "new", AFTER);
+        let (_, resizes) = t.claim_session_size_owner("b");
+        send_resizes(resizes);
+        assert_eq!(registered(&a), vec![BEFORE, AFTER], "A mirrors the claimer first");
+
+        send_resizes(t.remove_client("b"));
+        assert_eq!(registered(&a), vec![BEFORE, AFTER, BEFORE], "A has its own size again");
+        assert!(t.session_size_owner.is_empty());
+    }
+
+    #[test]
+    fn typing_in_a_renamed_session_moves_it_to_the_client_that_attached_before_the_rename() {
+        let mut t = ConnectionTable::default();
+        let a = attach(&mut t, "a", "old", BEFORE);
+        send_resizes(t.rename_session("a", "new"));
+        let b = attach(&mut t, "b", "new", AFTER);
+
+        send_resizes(t.on_user_input("a"));
+        assert_eq!(t.session_size_owner.get("new").map(String::as_str), Some("a"));
+        assert_eq!(t.session_size_owner.get("old"), None, "nothing is owned under the old name");
+        assert_eq!(registered(&b).last(), Some(&BEFORE), "B must mirror A, who typed");
+        assert_eq!(registered(&a).last(), Some(&BEFORE));
+    }
+
+    /// Every web client of the session receives its own RenamedSession, so the same rename
+    /// reaches the table once per client (and may be repeated).
+    #[test]
+    fn a_rename_delivered_twice_changes_nothing_the_second_time() {
+        let mut t = ConnectionTable::default();
+        let a = attach(&mut t, "a", "old", BEFORE);
+        let c = attach(&mut t, "c", "old", AFTER);
+        send_resizes(t.on_user_input("a")); // A owns "old"; C mirrors it
+
+        send_resizes(t.rename_session("a", "new"));
+        assert_eq!(
+            filed_under(&t, "new"),
+            (vec!["a".to_string(), "c".to_string()], Some("a".to_string()), Some(BEFORE)),
+            "both clients, the owner and the size move to the new name"
+        );
+        assert_eq!(filed_under(&t, "old"), (vec![], None, None), "nothing stays under the old name");
+
+        let sent = (registered(&a), registered(&c));
+        assert!(t.rename_session("c", "new").is_empty(), "C's own copy of the rename sends nothing");
+        assert!(t.rename_session("a", "new").is_empty(), "a repeated rename sends nothing");
+        assert_eq!(
+            filed_under(&t, "new"),
+            (vec!["a".to_string(), "c".to_string()], Some("a".to_string()), Some(BEFORE))
+        );
+        assert_eq!(filed_under(&t, "old"), (vec![], None, None));
+        assert_eq!((registered(&a), registered(&c)), sent, "and registers nobody again");
+    }
+
+    #[test]
+    fn a_different_session_created_later_under_the_old_name_shares_nothing_with_the_renamed_one() {
+        let mut t = ConnectionTable::default();
+        let a = attach(&mut t, "a", "old", BEFORE);
+        send_resizes(t.on_user_input("a")); // A owns the session
+        send_resizes(t.rename_session("a", "new"));
+        let b = attach(&mut t, "b", "new", AFTER); // A owns it: B's size is only remembered
+        let (sent_a, sent_b) = (registered(&a), registered(&b));
+
+        // A NEW session takes the name "old"; a client attaches to it without a size yet.
+        let stranger = MockClientOsApi::new();
+        t.add_new_client("x".to_string(), Box::new(stranger.clone()));
+        t.set_client_session("x", "old".to_string());
+        assert_eq!(
+            t.attach_size("x"),
+            NO_CLAMP_SIZE,
+            "it must take neither the renamed session's owner nor its last size"
+        );
+        let own = Size { rows: 30, cols: 100 };
+        send_resizes(t.on_terminal_resize("x", own));
+        assert_eq!(registered(&stranger), vec![own], "nobody owns the new session: it registers as reported");
+
+        let (others, resizes) = t.claim_session_size_owner("x");
+        assert_eq!(others, 0, "the renamed session's clients are not in the new session");
+        send_resizes(resizes);
+        assert_eq!((registered(&a), registered(&b)), (sent_a, sent_b), "A and B are untouched");
+
+        let (others, resizes) = t.claim_session_size_owner("b");
+        assert_eq!(others, 1, "the renamed session is A and B");
+        send_resizes(resizes);
+        assert_eq!(registered(&a).last(), Some(&AFTER));
+        assert_eq!(registered(&stranger).last(), Some(&own), "the new session's client is untouched");
+        assert_eq!(t.session_size_owner.get("old").map(String::as_str), Some("x"));
+        assert_eq!(t.session_size_owner.get("new").map(String::as_str), Some("b"));
+    }
+
+    /// A client can attach under the new name before the web layer has handled the rename
+    /// (the session server renames its socket first, then tells its clients). When the
+    /// rename arrives, that client is with the session's owner again and mirrors it.
+    #[test]
+    fn a_client_filed_under_the_new_name_before_the_rename_arrived_mirrors_the_owner() {
+        let mut t = ConnectionTable::default();
+        let a = attach(&mut t, "a", "old", BEFORE);
+        send_resizes(t.on_user_input("a")); // A owns the session
+        let early = attach(&mut t, "early", "new", AFTER);
+        assert_eq!(registered(&early), vec![AFTER], "not yet known to be in A's session");
+
+        send_resizes(t.rename_session("a", "new"));
+        assert_eq!(registered(&early).last(), Some(&BEFORE), "it mirrors the owner");
+        assert_eq!(registered(&a).last(), Some(&BEFORE));
+        assert_eq!(t.session_size_owner.get("new").map(String::as_str), Some("a"));
+    }
+
     #[test]
     fn only_the_user_acting_counts_as_activity() {
         for key in [&b"a"[..], b"\r", b"\x1b[A", b"\x1b[15~", b"\x1b[97;5u", b"\x1b[<0;10;5M",

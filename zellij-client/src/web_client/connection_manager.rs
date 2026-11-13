@@ -106,6 +106,64 @@ impl ConnectionTable {
             .insert(client_id.to_owned(), session_name);
     }
 
+    /// The session `client_id` is attached to was renamed to `new_name` (its
+    /// server sent this client `RenamedSession`). Everything filed under the
+    /// session's old name moves to the new one: every client of the session,
+    /// its size owner, its last size. Returns the resizes to send (with the
+    /// table's lock released).
+    ///
+    /// LOCAL PATCH (zellient#112): this table knows a session only by NAME, and
+    /// nothing told it of a rename. MEASURED 2026-11-13 on a session renamed
+    /// `ats` -> `LLMOS-R1`: the web client that attached before the rename
+    /// stayed filed under `ats`, the one that attached after it was filed under
+    /// `LLMOS-R1`, every claim from the second logged "0 other web client(s)
+    /// re-registered at its size", and the session stayed at the idle first
+    /// client's 76x49.
+    ///
+    /// The old name is the one THIS client is filed under, not a name the
+    /// caller remembers, so:
+    ///  * it is idempotent. Every web client of the session receives its own
+    ///    `RenamedSession`; the first moves them all and the rest find
+    ///    themselves already under the new name;
+    ///  * a client whose connect loop has since attached to another session is
+    ///    filed under that one, and is not moved.
+    /// The entries are MOVED, never copied: a different session that takes the
+    /// old name later starts with no clients, no owner and no size.
+    pub fn rename_session(&mut self, client_id: &str, new_name: &str) -> Vec<Resize> {
+        let Some(old_name) = self.client_id_to_session.get(client_id).cloned() else {
+            return vec![];
+        };
+        if old_name == new_name {
+            return vec![];
+        }
+        // The session server renames its socket before it tells its clients, so
+        // a client can already be filed under the new name.
+        let joins_clients_already_there = self
+            .client_id_to_session
+            .values()
+            .any(|session| session == new_name);
+        for session in self.client_id_to_session.values_mut() {
+            if *session == old_name {
+                *session = new_name.to_owned();
+            }
+        }
+        if let Some(owner) = self.session_size_owner.remove(&old_name) {
+            self.session_size_owner.insert(new_name.to_owned(), owner);
+        }
+        if let Some(size) = self.session_size.remove(&old_name) {
+            self.session_size.insert(new_name.to_owned(), size);
+        }
+        if !joins_clients_already_there {
+            return vec![]; // the same clients under another name: nobody's size changes
+        }
+        // Two groups became one session: all of it mirrors the owner again.
+        let owner = self.session_size_owner.get(new_name).cloned();
+        match owner.and_then(|owner| Some((self.client_size.get(&owner).copied()?, owner))) {
+            Some((size, owner)) => self.impose(new_name, &owner, size),
+            None => vec![],
+        }
+    }
+
     // THE SESSION FOLLOWS ITS MOST RECENTLY ACTIVE WEB CLIENT (zellient#7; tmux's
     // `window-size latest`). The session server renders a session at the MINIMUM
     // of its clients' registered sizes (min_client_terminal_size), so one idle
