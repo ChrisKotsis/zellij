@@ -128,6 +128,9 @@ pub trait ClientOsApi: Send + Sync + std::fmt::Debug {
     fn handle_signals(&self, sigwinch_cb: Box<dyn Fn()>, quit_cb: Box<dyn Fn()>);
     /// Establish a connection with the server socket.
     fn connect_to_server(&self, path: &Path);
+    /// The pid of the session server this client is connected to (zellient#115), or
+    /// None when it cannot be read.
+    fn server_pid(&self) -> Option<i32>;
     fn load_palette(&self) -> Palette;
     fn enable_mouse(&self) -> Result<()>;
     fn disable_mouse(&self) -> Result<()>;
@@ -277,6 +280,13 @@ impl ClientOsApi for ClientOsInputOutput {
         let receiver = sender.get_receiver();
         *self.send_instructions_to_server.lock().unwrap() = Some(sender);
         *self.receive_instructions_from_server.lock().unwrap() = Some(receiver);
+    }
+    fn server_pid(&self) -> Option<i32> {
+        self.send_instructions_to_server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|sender| sender.peer_pid())
     }
     fn load_palette(&self) -> Palette {
         // this was removed because termbg doesn't release stdin in certain scenarios (we know of

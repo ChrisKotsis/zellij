@@ -1,6 +1,6 @@
 use crate::os_input_output::ClientOsApi;
 use crate::web_client::control_message::WebServerToWebClientControlMessage;
-use crate::web_client::types::{ClientChannels, ClientConnectionBus, ConnectionTable};
+use crate::web_client::types::{ClientChannels, ClientConnectionBus, ConnectionTable, SessionId};
 use axum::extract::ws::{CloseFrame, Message};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -68,27 +68,38 @@ impl ConnectionTable {
     /// 2026-11-12: a 60x20 client kept receiving screens addressed to row 50,
     /// column 200 after the 200x50 owner had closed both sockets - a screen larger
     /// than its grid, which it draws as an incoherent scroll.
+    ///
+    /// LOCAL PATCH (zellient#115): a session's last client leaving forgets the session
+    /// (its name, owner and size). Session identities are pids, and a pid is reused.
     pub fn remove_client(&mut self, client_id: &str) -> Vec<Resize> {
         if let Some(mut client_channels) = self.client_id_to_channels.remove(client_id).take() {
             client_channels.cleanup();
         }
-        self.client_id_to_session.remove(client_id);
+        self.client_id_to_name.remove(client_id);
+        let session = self.client_id_to_session.remove(client_id);
         self.client_size.remove(client_id);
-        let owned: Vec<String> = self
+        let owned: Vec<SessionId> = self
             .session_size_owner
             .iter()
             .filter(|(_, owner)| owner.as_str() == client_id)
-            .map(|(session, _)| session.clone())
+            .map(|(session, _)| *session)
             .collect();
         // Release ownership: the next client to type (or claim) takes it.
         self.session_size_owner
             .retain(|_, owner| owner.as_str() != client_id);
         let mut out = vec![];
         for session in owned {
-            for other in self.others_in_session(&session, client_id) {
+            for other in self.others_in_session(session, client_id) {
                 if let Some(own) = self.client_size.get(&other).copied() {
                     out.extend(self.resize_for(&other, own));
                 }
+            }
+        }
+        if let Some(session) = session {
+            if !self.has_clients(session) {
+                self.session_names.remove(&session);
+                self.session_size_owner.remove(&session);
+                self.session_size.remove(&session);
             }
         }
         out
@@ -101,87 +112,79 @@ impl ConnectionTable {
         self.client_size.insert(client_id.to_owned(), size);
     }
 
+    /// The name `client_id` attaches as, before its connection is identified: the
+    /// size it attaches at is looked up by that name (`attach_size`). Ignored once
+    /// the client is connected, whose session is its server's identity.
+    ///
+    /// LOCAL PATCH (zellient#115): this used to file the client under the name, and the
+    /// name is what two renames could share.
     pub fn set_client_session(&mut self, client_id: &str, session_name: String) {
-        self.client_id_to_session
-            .insert(client_id.to_owned(), session_name);
+        if !self.client_id_to_session.contains_key(client_id) {
+            self.client_id_to_name
+                .insert(client_id.to_owned(), session_name);
+        }
     }
 
-    /// The session `client_id` is attached to was renamed to `new_name` (its
-    /// server sent this client `RenamedSession`). Everything filed under the
-    /// session's old name moves to the new one: every client of the session,
-    /// its size owner, its last size. Returns the resizes to send (with the
-    /// table's lock released).
+    /// The client's connection reached its session server, whose pid is `server` and whose
+    /// current name is `name` (the socket it connected to). From now on the client is filed
+    /// under that session, and nothing else (zellient#115). Returns the resize to send when the
+    /// session has an owner: a client that joins an owned session mirrors the owner's size from
+    /// its first moment in it, even when it attached before the table knew that session.
+    pub fn identify_client(&mut self, client_id: &str, server: SessionId, name: &str) -> Vec<Resize> {
+        self.client_id_to_name.remove(client_id);
+        self.client_id_to_session
+            .insert(client_id.to_owned(), server);
+        self.session_names.insert(server, name.to_owned());
+        let owner = self.session_size_owner.get(&server).cloned();
+        match owner {
+            Some(owner) if owner != client_id => match self.client_size.get(&owner).copied() {
+                Some(size) => self.resize_for(client_id, size).into_iter().collect(),
+                None => vec![],
+            },
+            _ => vec![],
+        }
+    }
+
+    /// The live session named `name`, when exactly one carries that name. A name is
+    /// ambiguous only while two sessions pass through it in one window (zellient#115);
+    /// then this is None, and the caller registers without a session's size rather than
+    /// guessing which of the two it is.
+    pub fn session_named(&self, name: &str) -> Option<SessionId> {
+        let mut found = self
+            .session_names
+            .iter()
+            .filter(|(_, n)| n.as_str() == name)
+            .map(|(session, _)| *session);
+        let first = found.next()?;
+        if found.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
+    }
+
+    /// The session `client_id` is attached to was renamed from `from` to `new_name` (its
+    /// server sent this client `RenamedSession`).
     ///
-    /// LOCAL PATCH (zellient#112): this table knows a session only by NAME, and
-    /// nothing told it of a rename. MEASURED 2026-11-13 on a session renamed
-    /// `ats` -> `LLMOS-R1`: the web client that attached before the rename
-    /// stayed filed under `ats`, the one that attached after it was filed under
-    /// `LLMOS-R1`, every claim from the second logged "0 other web client(s)
-    /// re-registered at its size", and the session stayed at the idle first
-    /// client's 76x49.
+    /// LOCAL PATCH (zellient#112, rebuilt on identity for zellient#115): the table used to
+    /// file clients by session NAME, so a rename had to move every entry filed under the old
+    /// name, and two sessions passing through one name in one window were merged for good.
+    /// Now a session is its server's pid. A rename changes only that session's name: no
+    /// client, owner or size moves, and no other session is touched, whatever its name.
     ///
-    /// `from` is the name this client's listener last knew its session by (the
-    /// name it attached as, then each rename it handled). The rename moves
-    /// anything only while the table still files the client under `from`:
-    ///  * it is idempotent. Every web client of the session receives its own
-    ///    `RenamedSession`; the first moves them all and the rest find
-    ///    themselves already under the new name;
-    ///  * a STALE rename is a no-op. Listeners read their own messages in
-    ///    order but not in step with each other: when a session is renamed
-    ///    old -> mid -> new and one listener has handled both before another
-    ///    handles its first, that one's `RenamedSession("mid")` finds its
-    ///    client under "new", not under its `from` ("old"), and must not carry
-    ///    the session back to "mid" (where a client attaching to "new" would
-    ///    claim alone: the original defect, for a moment);
-    ///  * a client whose connect loop has since attached to another session is
-    ///    filed under that one, and is not moved.
-    /// The entries are MOVED, never copied: a different session that takes the
-    /// old name later starts with no clients, no owner and no size.
-    ///
-    /// Not covered (zellient#115): the table knows a session only by name, so
-    /// two sessions renamed through the same name in one window (S1 one->tmp
-    /// while S2 two->one) are indistinguishable here.
-    pub fn rename_session(&mut self, client_id: &str, from: &str, new_name: &str) -> Vec<Resize> {
-        let Some(old_name) = self.client_id_to_session.get(client_id).cloned() else {
-            return vec![];
+    /// Idempotent and stale-safe: every web client of the session receives its own
+    /// `RenamedSession`, and listeners are not in step with each other. A rename applies
+    /// only while the session still carries `from`: when a session is renamed old -> mid ->
+    /// new and one listener handles `RenamedSession("mid")` after the session is already
+    /// "new", nothing moves back.
+    pub fn rename_session(&mut self, client_id: &str, from: &str, new_name: &str) {
+        let Some(session) = self.client_id_to_session.get(client_id).copied() else {
+            return;
         };
-        if old_name == new_name || old_name != from {
-            return vec![];
+        if self.session_names.get(&session).map(String::as_str) != Some(from) {
+            return;
         }
-        // The session server renames its socket before it tells its clients, so
-        // a client can already be filed under the new name.
-        let joins_clients_already_there = self
-            .client_id_to_session
-            .values()
-            .any(|session| session == new_name);
-        for session in self.client_id_to_session.values_mut() {
-            if *session == old_name {
-                *session = new_name.to_owned();
-            }
-        }
-        let moved_owner = self.session_size_owner.remove(&old_name);
-        let moved_size = self.session_size.remove(&old_name);
-        // A claim already made under the new name was made after the session
-        // server renamed its socket, so it is newer than anything filed under
-        // the old name: it stands, and the old name's owner and size are dropped
-        // ("the session follows its most recently active client").
-        if !self.session_size_owner.contains_key(new_name) {
-            if let Some(owner) = moved_owner {
-                self.session_size_owner.insert(new_name.to_owned(), owner);
-            }
-            if let Some(size) = moved_size {
-                self.session_size.insert(new_name.to_owned(), size);
-            }
-        }
-        if !joins_clients_already_there {
-            return vec![]; // the same clients under another name: nobody's size changes
-        }
-        // Two groups became one session: all of it mirrors the owner again.
-        let owner = self.session_size_owner.get(new_name).cloned();
-        match owner.and_then(|owner| Some((self.client_size.get(&owner).copied()?, owner))) {
-            Some((size, owner)) => self.impose(new_name, &owner, size),
-            None => vec![],
-        }
+        self.session_names.insert(session, new_name.to_owned());
     }
 
     // THE SESSION FOLLOWS ITS MOST RECENTLY ACTIVE WEB CLIENT (zellient#7; tmux's
@@ -204,14 +207,21 @@ impl ConnectionTable {
     /// its session last took from a web client, else NO_CLAMP_SIZE. Never the fd0
     /// fallback, which is how a silent attacher clamped everyone.
     pub fn attach_size(&self, client_id: &str) -> Size {
-        let Some(session) = self.client_id_to_session.get(client_id) else {
+        let session = match self.client_id_to_session.get(client_id).copied() {
+            Some(session) => Some(session),
+            None => self
+                .client_id_to_name
+                .get(client_id)
+                .and_then(|name| self.session_named(name)),
+        };
+        let Some(session) = session else {
             return self.client_size.get(client_id).copied().unwrap_or(NO_CLAMP_SIZE);
         };
         self.session_size_owner
-            .get(session)
+            .get(&session)
             .and_then(|owner| self.client_size.get(owner))
             .or_else(|| self.client_size.get(client_id))
-            .or_else(|| self.session_size.get(session))
+            .or_else(|| self.session_size.get(&session))
             .copied()
             .unwrap_or(NO_CLAMP_SIZE)
     }
@@ -222,12 +232,12 @@ impl ConnectionTable {
     /// becomes the owner itself). Returns the resizes to send.
     pub fn on_terminal_resize(&mut self, client_id: &str, size: Size) -> Vec<Resize> {
         self.client_size.insert(client_id.to_owned(), size);
-        let Some(session) = self.client_id_to_session.get(client_id).cloned() else {
+        let Some(session) = self.client_id_to_session.get(client_id).copied() else {
             return self.resize_for(client_id, size).into_iter().collect();
         };
         match self.session_size_owner.get(&session) {
             Some(owner) if owner != client_id => vec![],
-            Some(_) => self.impose(&session, client_id, size),
+            Some(_) => self.impose(session, client_id, size),
             None => {
                 self.session_size.insert(session, size);
                 self.resize_for(client_id, size).into_iter().collect()
@@ -239,7 +249,7 @@ impl ConnectionTable {
     /// follows it. Nothing to send when it already owns the session, or when it
     /// has never reported a size (it has no size to impose).
     pub fn on_user_input(&mut self, client_id: &str) -> Vec<Resize> {
-        let Some(session) = self.client_id_to_session.get(client_id).cloned() else {
+        let Some(session) = self.client_id_to_session.get(client_id).copied() else {
             return vec![];
         };
         if self.session_size_owner.get(&session).map(String::as_str) == Some(client_id) {
@@ -249,30 +259,30 @@ impl ConnectionTable {
             return vec![];
         };
         self.session_size_owner
-            .insert(session.clone(), client_id.to_owned());
-        self.impose(&session, client_id, size)
+            .insert(session, client_id.to_owned());
+        self.impose(session, client_id, size)
     }
 
     /// An explicit claim (DetachOtherClients: Zellient's Ctrl+0 and Ctrl+Shift+O).
     /// Returns how many other web clients of the session now mirror the
     /// requester, and the resizes that make them.
     pub fn claim_session_size_owner(&mut self, requester_id: &str) -> (usize, Vec<Resize>) {
-        let Some(session) = self.client_id_to_session.get(requester_id).cloned() else {
+        let Some(session) = self.client_id_to_session.get(requester_id).copied() else {
             return (0, vec![]);
         };
-        let others = self.others_in_session(&session, requester_id).len();
+        let others = self.others_in_session(session, requester_id).len();
         self.session_size_owner
-            .insert(session.clone(), requester_id.to_owned());
+            .insert(session, requester_id.to_owned());
         let resizes = match self.client_size.get(requester_id).copied() {
-            Some(size) => self.impose(&session, requester_id, size),
+            Some(size) => self.impose(session, requester_id, size),
             None => vec![],
         };
         (others, resizes)
     }
 
     /// Register `owner` and every other web client of `session` at `size`.
-    fn impose(&mut self, session: &str, owner: &str, size: Size) -> Vec<Resize> {
-        self.session_size.insert(session.to_owned(), size);
+    fn impose(&mut self, session: SessionId, owner: &str, size: Size) -> Vec<Resize> {
+        self.session_size.insert(session, size);
         let mut out: Vec<Resize> = self.resize_for(owner, size).into_iter().collect();
         for other in self.others_in_session(session, owner) {
             out.extend(self.resize_for(&other, size));
@@ -280,10 +290,14 @@ impl ConnectionTable {
         out
     }
 
-    fn others_in_session(&self, session: &str, except: &str) -> Vec<String> {
+    fn has_clients(&self, session: SessionId) -> bool {
+        self.client_id_to_session.values().any(|s| *s == session)
+    }
+
+    fn others_in_session(&self, session: SessionId, except: &str) -> Vec<String> {
         self.client_id_to_session
             .iter()
-            .filter(|(id, sess)| id.as_str() != except && sess.as_str() == session)
+            .filter(|(id, sess)| id.as_str() != except && **sess == session)
             .map(|(id, _)| id.clone())
             .collect()
     }

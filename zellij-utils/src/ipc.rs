@@ -220,6 +220,29 @@ impl<T: Serialize> IpcSenderWithContext<T> {
         let socket = unsafe { LocalSocketStream::from_raw_fd(dup_sock) };
         IpcReceiverWithContext::new(socket)
     }
+
+    /// The pid of the process at the other end of this socket, as the kernel reports it
+    /// (SO_PEERCRED). LOCAL PATCH (zellient#115): the web layer names a session's
+    /// connections by this, not by the session's name. Linux only, which is where the
+    /// web server runs; elsewhere it is logged and reads as unknown.
+    pub fn peer_pid(&self) -> Option<i32> {
+        #[cfg(target_os = "linux")]
+        {
+            let sock_fd = self.sender.get_ref().as_raw_fd();
+            match nix::sys::socket::getsockopt(sock_fd, nix::sys::socket::sockopt::PeerCredentials) {
+                Ok(cred) => Some(cred.pid()),
+                Err(e) => {
+                    log::error!("SO_PEERCRED on a session socket failed: {}", e);
+                    None
+                },
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            log::error!("reading a session server's pid needs SO_PEERCRED (Linux only)");
+            None
+        }
+    }
 }
 
 /// Receives messages on a stream socket, along with an [`ErrorContext`].

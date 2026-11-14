@@ -152,6 +152,23 @@ pub fn zellij_server_listener(
                     };
 
                     os_input.connect_to_server(&zellij_ipc_pipe);
+                    // LOCAL PATCH (zellient#115): the connection table files this client under
+                    // its session's IDENTITY, the pid of the server it just connected to, not
+                    // under a name that two renames can share.
+                    match os_input.server_pid() {
+                        Some(server) => {
+                            let resizes = connection_table.lock().unwrap().identify_client(
+                                &web_client_id,
+                                server,
+                                &session_name,
+                            );
+                            send_resizes(resizes);
+                        },
+                        None => log::error!(
+                            "web client {}: the session server's pid could not be read, so it is not filed under its session",
+                            web_client_id
+                        ),
+                    }
                     os_input.send_to_server(first_message);
 
                     client_connection_bus.send_control(
@@ -203,18 +220,13 @@ pub fn zellij_server_listener(
                                 );
                             },
                             Some((ServerToClientMsg::RenamedSession(new_session_name), _)) => {
-                                // LOCAL PATCH (zellient#112): the connection table
-                                // files this client, its session's size owner and
-                                // last size under the session's NAME. A rename that
-                                // only reached the browser left a client attached
-                                // before it and one attached after it in two
-                                // "sessions", and a size claim reached nobody.
-                                let resizes = connection_table.lock().unwrap().rename_session(
+                                // LOCAL PATCH (zellient#112, zellient#115): this client's session
+                                // is renamed in the connection table, and nothing else is.
+                                connection_table.lock().unwrap().rename_session(
                                     &web_client_id,
                                     &attached_as,
                                     &new_session_name,
                                 );
-                                send_resizes(resizes);
                                 attached_as = new_session_name.clone();
                                 client_connection_bus.send_control(
                                     WebServerToWebClientControlMessage::SwitchedSession {

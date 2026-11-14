@@ -111,23 +111,34 @@ impl SessionManager for RealSessionManager {
     }
 }
 
+/// A session's identity: the pid of its session server (zellient#115). A session
+/// keeps it through renames, and two sessions never share it while both are alive,
+/// which the session's NAME cannot promise (a name is freed by a rename and can be
+/// taken again by another session in the same window).
+pub type SessionId = i32;
+
 #[derive(Debug, Default, Clone)]
 pub struct ConnectionTable {
     pub client_id_to_channels: HashMap<String, ClientChannels>,
-    // web_client_id -> session name it attached to, so "detach other clients"
-    // can be scoped to the requester's session.
-    pub client_id_to_session: HashMap<String, String>,
-    // session name -> web_client_id that owns the session size: the most
+    // web_client_id -> the session it is connected to, so "detach other clients"
+    // can be scoped to the requester's session. Set when its listener connects.
+    pub client_id_to_session: HashMap<String, SessionId>,
+    // web_client_id -> the name it attached as, until its connection is identified
+    // (the size it attaches at is looked up by name before the connection exists).
+    pub client_id_to_name: HashMap<String, String>,
+    // session identity -> the name its clients last heard it renamed to.
+    pub session_names: HashMap<SessionId, String>,
+    // session identity -> web_client_id that owns the session size: the most
     // recently ACTIVE web client of that session (tmux `window-size latest`).
     // Every other web client of the session is registered at the owner's size,
     // so zellij's minimum-over-clients is the owner. See connection_manager.rs.
-    pub session_size_owner: HashMap<String, String>,
+    pub session_size_owner: HashMap<SessionId, String>,
     // web_client_id -> the size that client last reported (TerminalResize).
     pub client_size: HashMap<String, Size>,
-    // session name -> the size the web layer last registered for it. A late
+    // session identity -> the size the web layer last registered for it. A late
     // attacher that has not reported a size yet registers at this, never at the
     // daemon's fd0 fallback (80x24).
-    pub session_size: HashMap<String, Size>,
+    pub session_size: HashMap<SessionId, Size>,
 }
 
 #[derive(Debug, Clone)]
