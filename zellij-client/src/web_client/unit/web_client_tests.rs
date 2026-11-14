@@ -2365,7 +2365,7 @@ mod session_size_follows_the_active_client {
     fn a_claim_after_a_rename_resizes_the_client_that_attached_before_it() {
         let mut t = ConnectionTable::default();
         let a = attach(&mut t, "a", "old", BEFORE);
-        send_resizes(t.rename_session("a", "new"));
+        send_resizes(t.rename_session("a", "old", "new"));
         let b = attach(&mut t, "b", "new", AFTER);
 
         let (others, resizes) = t.claim_session_size_owner("b");
@@ -2379,7 +2379,7 @@ mod session_size_follows_the_active_client {
     fn the_claimer_leaving_a_renamed_session_gives_the_earlier_client_its_own_size_back() {
         let mut t = ConnectionTable::default();
         let a = attach(&mut t, "a", "old", BEFORE);
-        send_resizes(t.rename_session("a", "new"));
+        send_resizes(t.rename_session("a", "old", "new"));
         let _b = attach(&mut t, "b", "new", AFTER);
         let (_, resizes) = t.claim_session_size_owner("b");
         send_resizes(resizes);
@@ -2394,7 +2394,7 @@ mod session_size_follows_the_active_client {
     fn typing_in_a_renamed_session_moves_it_to_the_client_that_attached_before_the_rename() {
         let mut t = ConnectionTable::default();
         let a = attach(&mut t, "a", "old", BEFORE);
-        send_resizes(t.rename_session("a", "new"));
+        send_resizes(t.rename_session("a", "old", "new"));
         let b = attach(&mut t, "b", "new", AFTER);
 
         send_resizes(t.on_user_input("a"));
@@ -2413,7 +2413,7 @@ mod session_size_follows_the_active_client {
         let c = attach(&mut t, "c", "old", AFTER);
         send_resizes(t.on_user_input("a")); // A owns "old"; C mirrors it
 
-        send_resizes(t.rename_session("a", "new"));
+        send_resizes(t.rename_session("a", "old", "new"));
         assert_eq!(
             filed_under(&t, "new"),
             (vec!["a".to_string(), "c".to_string()], Some("a".to_string()), Some(BEFORE)),
@@ -2422,8 +2422,8 @@ mod session_size_follows_the_active_client {
         assert_eq!(filed_under(&t, "old"), (vec![], None, None), "nothing stays under the old name");
 
         let sent = (registered(&a), registered(&c));
-        assert!(t.rename_session("c", "new").is_empty(), "C's own copy of the rename sends nothing");
-        assert!(t.rename_session("a", "new").is_empty(), "a repeated rename sends nothing");
+        assert!(t.rename_session("c", "old", "new").is_empty(), "C's own copy of the rename sends nothing");
+        assert!(t.rename_session("a", "old", "new").is_empty(), "a repeated rename sends nothing");
         assert_eq!(
             filed_under(&t, "new"),
             (vec!["a".to_string(), "c".to_string()], Some("a".to_string()), Some(BEFORE))
@@ -2437,7 +2437,7 @@ mod session_size_follows_the_active_client {
         let mut t = ConnectionTable::default();
         let a = attach(&mut t, "a", "old", BEFORE);
         send_resizes(t.on_user_input("a")); // A owns the session
-        send_resizes(t.rename_session("a", "new"));
+        send_resizes(t.rename_session("a", "old", "new"));
         let b = attach(&mut t, "b", "new", AFTER); // A owns it: B's size is only remembered
         let (sent_a, sent_b) = (registered(&a), registered(&b));
 
@@ -2479,10 +2479,66 @@ mod session_size_follows_the_active_client {
         let early = attach(&mut t, "early", "new", AFTER);
         assert_eq!(registered(&early), vec![AFTER], "not yet known to be in A's session");
 
-        send_resizes(t.rename_session("a", "new"));
+        send_resizes(t.rename_session("a", "old", "new"));
         assert_eq!(registered(&early).last(), Some(&BEFORE), "it mirrors the owner");
         assert_eq!(registered(&a).last(), Some(&BEFORE));
         assert_eq!(t.session_size_owner.get("new").map(String::as_str), Some("a"));
+    }
+
+    /// Review probe P1 (2026-11-13): the device that claimed under the new name, in the window
+    /// before the rename reached the web layer, pressed Ctrl+0 AFTER the idle owner of the old
+    /// name last acted. Its claim stands; the idle client mirrors it.
+    #[test]
+    fn a_claim_made_under_the_new_name_before_the_rename_arrived_outranks_the_old_owner() {
+        let mut t = ConnectionTable::default();
+        let a = attach(&mut t, "a", "old", BEFORE);
+        send_resizes(t.on_user_input("a")); // A owns "old", then goes idle
+        let b = attach(&mut t, "b", "new", AFTER);
+        let (others, resizes) = t.claim_session_size_owner("b");
+        assert_eq!(others, 0, "before the rename arrives, B is alone under the new name");
+        send_resizes(resizes);
+
+        send_resizes(t.rename_session("a", "old", "new"));
+        assert_eq!(
+            filed_under(&t, "new"),
+            (vec!["a".to_string(), "b".to_string()], Some("b".to_string()), Some(AFTER)),
+            "one session, owned by the client that claimed most recently, at its size"
+        );
+        assert_eq!(filed_under(&t, "old"), (vec![], None, None));
+        assert_eq!(registered(&a).last(), Some(&AFTER), "the idle client mirrors the claimer");
+        assert!(
+            registered(&b).iter().all(|s| *s == AFTER),
+            "the claimer is never registered at the idle client's size: {:?}",
+            registered(&b)
+        );
+    }
+
+    /// Review probe P2 (2026-11-13): renames old -> mid -> new. A's listener handles both before
+    /// B's listener handles its first. B's RenamedSession("mid") is stale: B is already filed
+    /// under "new", not under the "old" its listener last knew, so nothing may move back to "mid".
+    #[test]
+    fn a_stale_rename_handled_after_a_later_one_moves_nothing_back() {
+        let mut t = ConnectionTable::default();
+        let a = attach(&mut t, "a", "old", BEFORE);
+        let b = attach(&mut t, "b", "old", AFTER);
+        send_resizes(t.on_user_input("a")); // A owns the session; B mirrors it
+        send_resizes(t.rename_session("a", "old", "mid"));
+        send_resizes(t.rename_session("a", "mid", "new"));
+        let sent = (registered(&a), registered(&b));
+
+        assert!(t.rename_session("b", "old", "mid").is_empty(), "B's stale rename sends nothing");
+        assert_eq!(filed_under(&t, "mid"), (vec![], None, None), "nothing is carried back to mid");
+        assert_eq!(
+            filed_under(&t, "new"),
+            (vec!["a".to_string(), "b".to_string()], Some("a".to_string()), Some(BEFORE))
+        );
+        assert!(t.rename_session("b", "mid", "new").is_empty(), "B's next rename finds it done");
+        assert_eq!((registered(&a), registered(&b)), sent, "and registers nobody again");
+
+        // A client attaching to the real name now is in the same session as A and B.
+        let _c = attach(&mut t, "c", "new", Size { rows: 30, cols: 100 });
+        let (others, _) = t.claim_session_size_owner("c");
+        assert_eq!(others, 2, "the claimer reaches both clients of the renamed session");
     }
 
     #[test]

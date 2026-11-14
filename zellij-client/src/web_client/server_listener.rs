@@ -160,6 +160,9 @@ pub fn zellij_server_listener(
                         },
                     );
 
+                    // The name this listener knows its session by: the one it
+                    // attached as, then each rename it handles (zellient#112).
+                    let mut attached_as = session_name.clone();
                     loop {
                         match os_input.recv_from_server() {
                             Some((ServerToClientMsg::UnblockInputThread, _)) => {},
@@ -206,11 +209,13 @@ pub fn zellij_server_listener(
                                 // only reached the browser left a client attached
                                 // before it and one attached after it in two
                                 // "sessions", and a size claim reached nobody.
-                                let resizes = connection_table
-                                    .lock()
-                                    .unwrap()
-                                    .rename_session(&web_client_id, &new_session_name);
+                                let resizes = connection_table.lock().unwrap().rename_session(
+                                    &web_client_id,
+                                    &attached_as,
+                                    &new_session_name,
+                                );
                                 send_resizes(resizes);
+                                attached_as = new_session_name.clone();
                                 client_connection_bus.send_control(
                                     WebServerToWebClientControlMessage::SwitchedSession {
                                         new_session_name,

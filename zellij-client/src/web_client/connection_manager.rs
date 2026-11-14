@@ -120,20 +120,32 @@ impl ConnectionTable {
     /// re-registered at its size", and the session stayed at the idle first
     /// client's 76x49.
     ///
-    /// The old name is the one THIS client is filed under, not a name the
-    /// caller remembers, so:
+    /// `from` is the name this client's listener last knew its session by (the
+    /// name it attached as, then each rename it handled). The rename moves
+    /// anything only while the table still files the client under `from`:
     ///  * it is idempotent. Every web client of the session receives its own
     ///    `RenamedSession`; the first moves them all and the rest find
     ///    themselves already under the new name;
+    ///  * a STALE rename is a no-op. Listeners read their own messages in
+    ///    order but not in step with each other: when a session is renamed
+    ///    old -> mid -> new and one listener has handled both before another
+    ///    handles its first, that one's `RenamedSession("mid")` finds its
+    ///    client under "new", not under its `from` ("old"), and must not carry
+    ///    the session back to "mid" (where a client attaching to "new" would
+    ///    claim alone: the original defect, for a moment);
     ///  * a client whose connect loop has since attached to another session is
     ///    filed under that one, and is not moved.
     /// The entries are MOVED, never copied: a different session that takes the
     /// old name later starts with no clients, no owner and no size.
-    pub fn rename_session(&mut self, client_id: &str, new_name: &str) -> Vec<Resize> {
+    ///
+    /// Not covered (zellient#115): the table knows a session only by name, so
+    /// two sessions renamed through the same name in one window (S1 one->tmp
+    /// while S2 two->one) are indistinguishable here.
+    pub fn rename_session(&mut self, client_id: &str, from: &str, new_name: &str) -> Vec<Resize> {
         let Some(old_name) = self.client_id_to_session.get(client_id).cloned() else {
             return vec![];
         };
-        if old_name == new_name {
+        if old_name == new_name || old_name != from {
             return vec![];
         }
         // The session server renames its socket before it tells its clients, so
@@ -147,11 +159,19 @@ impl ConnectionTable {
                 *session = new_name.to_owned();
             }
         }
-        if let Some(owner) = self.session_size_owner.remove(&old_name) {
-            self.session_size_owner.insert(new_name.to_owned(), owner);
-        }
-        if let Some(size) = self.session_size.remove(&old_name) {
-            self.session_size.insert(new_name.to_owned(), size);
+        let moved_owner = self.session_size_owner.remove(&old_name);
+        let moved_size = self.session_size.remove(&old_name);
+        // A claim already made under the new name was made after the session
+        // server renamed its socket, so it is newer than anything filed under
+        // the old name: it stands, and the old name's owner and size are dropped
+        // ("the session follows its most recently active client").
+        if !self.session_size_owner.contains_key(new_name) {
+            if let Some(owner) = moved_owner {
+                self.session_size_owner.insert(new_name.to_owned(), owner);
+            }
+            if let Some(size) = moved_size {
+                self.session_size.insert(new_name.to_owned(), size);
+            }
         }
         if !joins_clients_already_there {
             return vec![]; // the same clients under another name: nobody's size changes
