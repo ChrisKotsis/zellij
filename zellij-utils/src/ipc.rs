@@ -282,3 +282,24 @@ where
         IpcSenderWithContext::new(socket)
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod peer_pid_tests {
+    use super::*;
+    use interprocess::local_socket::LocalSocketListener;
+
+    /// zellient#115, measured on a real socket: a connection to a listener in this process
+    /// reports this process's pid as its peer's.
+    #[test]
+    fn a_connected_socket_reports_the_pid_at_its_other_end() {
+        let path = std::env::temp_dir().join(format!("zellij-peer-pid-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = LocalSocketListener::bind(&*path).expect("bind a listener");
+        let stream = LocalSocketStream::connect(&*path).expect("connect to it");
+        let sender = IpcSenderWithContext::<ClientToServerMsg>::new(stream);
+        let peer = sender.peer_pid();
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(peer, Some(std::process::id() as i32));
+    }
+}
