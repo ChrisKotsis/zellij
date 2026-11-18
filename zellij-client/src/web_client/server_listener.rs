@@ -1,7 +1,10 @@
 use crate::os_input_output::ClientOsApi;
+use crate::web_client::connection_manager::send_resizes;
 use crate::web_client::control_message::WebServerToWebClientControlMessage;
-use crate::web_client::session_management::build_initial_connection;
-use crate::web_client::types::{ClientConnectionBus, ConnectionTable, SessionManager};
+use crate::web_client::session_management::{build_initial_connection, policy_for_pass};
+use crate::web_client::types::{
+    ClientConnectionBus, ConnectionTable, SessionCreationPolicy, SessionManager,
+};
 use crate::web_client::utils::terminal_init_messages;
 
 use std::{
@@ -26,6 +29,7 @@ pub fn zellij_server_listener(
     config_file_path: Option<PathBuf>,
     web_client_id: String,
     session_manager: Arc<dyn SessionManager>,
+    create_policy: SessionCreationPolicy,
 ) {
     let _server_listener_thread = std::thread::Builder::new()
         .name("server_listener".to_string())
@@ -41,7 +45,19 @@ pub fn zellij_server_listener(
                             return;
                         },
                     };
+                // LOCAL PATCH (web session ownership, llmos#15114): the request
+                // that OPENED this socket decides the FIRST pass only. A later
+                // pass happens when the session this socket is attached to sent
+                // SwitchSession: zellij's own session manager or welcome screen,
+                // driven by the person at that terminal ("new session",
+                // "resurrect"). The server forwards that name WITHOUT checking
+                // that it runs (zellij-server lib.rs, SwitchSession), so that
+                // pass has to be able to create, or the welcome screen of an
+                // unnamed request is a dead end. A lane's name is refused on
+                // every pass by `decide_session_action`.
+                let mut request_policy = Some(create_policy);
                 'reconnect_loop: loop {
+                    let this_create_policy = policy_for_pass(request_policy.take());
                     let reconnect_info = reconnect_to_session.take();
                     let path = {
                         let Some(session_name) = reconnect_info
@@ -113,16 +129,22 @@ pub fn zellij_server_listener(
                             os_input.clone(),
                             reconnect_info.as_ref().and_then(|r| r.layout.clone()),
                             is_welcome_screen,
+                            this_create_policy,
                         ) {
                         Ok(msg_and_pipe) => msg_and_pipe,
                         Err(e) => {
-                            log::error!(
-                                "Failed to spawn session {:?}: {}",
+                            // LOCAL PATCH (web session ownership, llmos#15114):
+                            // a refusal is not a spawn failure — say so in the
+                            // terminal instead of "Error creating session", so a
+                            // stale tab reads "session ended" and stops
+                            // re-minting it.
+                            log::info!(
+                                "Refusing web connection to session {:?}: {}",
                                 session_name,
                                 e
                             );
                             client_connection_bus.send_stdout(format!(
-                                "\r\nError creating session {:?}: {}\r\n",
+                                "\u{1b}[2J\r\nSession {:?} is not available.\r\n\r\n{}\r\n",
                                 session_name, e
                             ));
                             return;
@@ -130,6 +152,23 @@ pub fn zellij_server_listener(
                     };
 
                     os_input.connect_to_server(&zellij_ipc_pipe);
+                    // LOCAL PATCH (zellient#115): the connection table files this client under
+                    // its session's IDENTITY, the pid of the server it just connected to, not
+                    // under a name that two renames can share.
+                    match os_input.server_pid() {
+                        Some(server) => {
+                            let resizes = connection_table.lock().unwrap().identify_client(
+                                &web_client_id,
+                                server,
+                                &session_name,
+                            );
+                            send_resizes(resizes);
+                        },
+                        None => log::error!(
+                            "web client {}: the session server's pid could not be read, so it is not filed under its session",
+                            web_client_id
+                        ),
+                    }
                     os_input.send_to_server(first_message);
 
                     client_connection_bus.send_control(
@@ -138,6 +177,9 @@ pub fn zellij_server_listener(
                         },
                     );
 
+                    // The name this listener knows its session by: the one it
+                    // attached as, then each rename it handles (zellient#112).
+                    let mut attached_as = session_name.clone();
                     loop {
                         match os_input.recv_from_server() {
                             Some((ServerToClientMsg::UnblockInputThread, _)) => {},
@@ -178,6 +220,14 @@ pub fn zellij_server_listener(
                                 );
                             },
                             Some((ServerToClientMsg::RenamedSession(new_session_name), _)) => {
+                                // LOCAL PATCH (zellient#112, zellient#115): this client's session
+                                // is renamed in the connection table, and nothing else is.
+                                connection_table.lock().unwrap().rename_session(
+                                    &web_client_id,
+                                    &attached_as,
+                                    &new_session_name,
+                                );
+                                attached_as = new_session_name.clone();
                                 client_connection_bus.send_control(
                                     WebServerToWebClientControlMessage::SwitchedSession {
                                         new_session_name,

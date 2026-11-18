@@ -220,6 +220,29 @@ impl<T: Serialize> IpcSenderWithContext<T> {
         let socket = unsafe { LocalSocketStream::from_raw_fd(dup_sock) };
         IpcReceiverWithContext::new(socket)
     }
+
+    /// The pid of the process at the other end of this socket, as the kernel reports it
+    /// (SO_PEERCRED). LOCAL PATCH (zellient#115): the web layer names a session's
+    /// connections by this, not by the session's name. Linux only, which is where the
+    /// web server runs; elsewhere it is logged and reads as unknown.
+    pub fn peer_pid(&self) -> Option<i32> {
+        #[cfg(target_os = "linux")]
+        {
+            let sock_fd = self.sender.get_ref().as_raw_fd();
+            match nix::sys::socket::getsockopt(sock_fd, nix::sys::socket::sockopt::PeerCredentials) {
+                Ok(cred) => Some(cred.pid()),
+                Err(e) => {
+                    log::error!("SO_PEERCRED on a session socket failed: {}", e);
+                    None
+                },
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            log::error!("reading a session server's pid needs SO_PEERCRED (Linux only)");
+            None
+        }
+    }
 }
 
 /// Receives messages on a stream socket, along with an [`ErrorContext`].
@@ -257,5 +280,26 @@ where
         let dup_sock = dup(sock_fd).unwrap();
         let socket = unsafe { LocalSocketStream::from_raw_fd(dup_sock) };
         IpcSenderWithContext::new(socket)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod peer_pid_tests {
+    use super::*;
+    use interprocess::local_socket::LocalSocketListener;
+
+    /// zellient#115, measured on a real socket: a connection to a listener in this process
+    /// reports this process's pid as its peer's.
+    #[test]
+    fn a_connected_socket_reports_the_pid_at_its_other_end() {
+        let path = std::env::temp_dir().join(format!("zellij-peer-pid-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = LocalSocketListener::bind(&*path).expect("bind a listener");
+        let stream = LocalSocketStream::connect(&*path).expect("connect to it");
+        let sender = IpcSenderWithContext::<ClientToServerMsg>::new(stream);
+        let peer = sender.peer_pid();
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(peer, Some(std::process::id() as i32));
     }
 }

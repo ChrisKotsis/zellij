@@ -7,7 +7,9 @@ use crate::web_client::message_handlers::{
     is_user_activity, parse_stdin, render_to_client, send_control_messages_to_client,
 };
 use crate::web_client::server_listener::zellij_server_listener;
+use crate::web_client::session_management::session_creation_policy;
 use crate::web_client::types::{AppState, TerminalParams};
+use crate::web_client::utils::parse_create_flag;
 
 use axum::{
     extract::{
@@ -18,7 +20,7 @@ use axum::{
 };
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
-use zellij_utils::{input::mouse::MouseEvent, ipc::ClientToServerMsg};
+use zellij_utils::{input::mouse::MouseEvent, ipc::ClientToServerMsg, pane_size::Size};
 
 pub async fn ws_handler_control(
     ws: WebSocketUpgrade,
@@ -168,6 +170,28 @@ async fn handle_ws_terminal(
             .unwrap()
             .set_client_session(&web_client_id, sname.clone());
     }
+    // LOCAL PATCH (llmos#16153): a client that states its grid on the attach is
+    // registered at it, so its first screen fits it.
+    if let (Some(cols), Some(rows)) = (params.cols, params.rows) {
+        if cols > 0 && rows > 0 {
+            state.connection_table.lock().unwrap().state_client_size(
+                &web_client_id,
+                Size {
+                    rows: rows as usize,
+                    cols: cols as usize,
+                },
+            );
+        }
+    }
+
+    // LOCAL PATCH (web session ownership, llmos#15114): whether this socket may
+    // CREATE the session it names. A named request is attach-only unless it
+    // carries an explicit create intent; an unnamed request asks for a terminal
+    // and the server picks the name, so it may create.
+    let create_policy = session_creation_policy(
+        session_name.as_ref().map(|p| p.0.as_str()),
+        parse_create_flag(params.create.as_deref()),
+    );
 
     zellij_server_listener(
         os_input.clone(),
@@ -178,6 +202,7 @@ async fn handle_ws_terminal(
         Some(state.config_file_path.clone()),
         web_client_id.clone(),
         state.session_manager.clone(),
+        create_policy,
     );
 
     let terminal_channel_cancellation_token = CancellationToken::new();
@@ -235,11 +260,12 @@ async fn handle_ws_terminal(
                 );
             },
             Message::Close(_) => {
-                state
+                let resizes = state
                     .connection_table
                     .lock()
                     .unwrap()
                     .remove_client(&web_client_id);
+                send_resizes(resizes);
                 break;
             },
             _ => {

@@ -29,6 +29,21 @@ impl ClientOsApiFactory for RealClientOsApiFactory {
     }
 }
 
+/// Whether this web connection is allowed to CREATE the session it names.
+///
+/// LOCAL PATCH (web session ownership, llmos#15114): the web client used to
+/// create-or-resurrect ANY session name a browser asked for, so a Zellient tab
+/// left open on a lane's session re-minted that session seconds after the
+/// janitor deleted it (the husk loop of llmos#15108). Creation is now an
+/// explicit request (`?create=1`); a plain named attach is attach-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCreationPolicy {
+    /// Attach to the session if it is live; otherwise fail this connection.
+    AttachOnly,
+    /// Attach if live, otherwise spawn (or resurrect) the session.
+    CreateIfMissing,
+}
+
 pub trait SessionManager: Send + Sync + std::fmt::Debug {
     fn session_exists(&self, session_name: &str) -> Result<bool, Box<dyn std::error::Error>>;
     fn get_resurrection_layout(
@@ -46,6 +61,7 @@ pub trait SessionManager: Send + Sync + std::fmt::Debug {
         os_input: Box<dyn ClientOsApi>,
         requested_layout: Option<LayoutInfo>,
         is_welcome_screen: bool,
+        create_policy: SessionCreationPolicy,
     ) -> Result<(ClientToServerMsg, PathBuf), String>;
 }
 
@@ -78,6 +94,7 @@ impl SessionManager for RealSessionManager {
         os_input: Box<dyn ClientOsApi>,
         requested_layout: Option<LayoutInfo>,
         is_welcome_screen: bool,
+        create_policy: SessionCreationPolicy,
     ) -> Result<(ClientToServerMsg, PathBuf), String> {
         crate::web_client::session_management::spawn_session_if_needed(
             session_name,
@@ -89,27 +106,39 @@ impl SessionManager for RealSessionManager {
             os_input,
             requested_layout,
             is_welcome_screen,
+            create_policy,
         )
     }
 }
 
+/// A session's identity: the pid of its session server (zellient#115). A session
+/// keeps it through renames, and two sessions never share it while both are alive,
+/// which the session's NAME cannot promise (a name is freed by a rename and can be
+/// taken again by another session in the same window).
+pub type SessionId = i32;
+
 #[derive(Debug, Default, Clone)]
 pub struct ConnectionTable {
     pub client_id_to_channels: HashMap<String, ClientChannels>,
-    // web_client_id -> session name it attached to, so "detach other clients"
-    // can be scoped to the requester's session.
-    pub client_id_to_session: HashMap<String, String>,
-    // session name -> web_client_id that owns the session size: the most
+    // web_client_id -> the session it is connected to, so "detach other clients"
+    // can be scoped to the requester's session. Set when its listener connects.
+    pub client_id_to_session: HashMap<String, SessionId>,
+    // web_client_id -> the name it attached as, until its connection is identified
+    // (the size it attaches at is looked up by name before the connection exists).
+    pub client_id_to_name: HashMap<String, String>,
+    // session identity -> the name its clients last heard it renamed to.
+    pub session_names: HashMap<SessionId, String>,
+    // session identity -> web_client_id that owns the session size: the most
     // recently ACTIVE web client of that session (tmux `window-size latest`).
     // Every other web client of the session is registered at the owner's size,
     // so zellij's minimum-over-clients is the owner. See connection_manager.rs.
-    pub session_size_owner: HashMap<String, String>,
+    pub session_size_owner: HashMap<SessionId, String>,
     // web_client_id -> the size that client last reported (TerminalResize).
     pub client_size: HashMap<String, Size>,
-    // session name -> the size the web layer last registered for it. A late
+    // session identity -> the size the web layer last registered for it. A late
     // attacher that has not reported a size yet registers at this, never at the
     // daemon's fd0 fallback (80x24).
-    pub session_size: HashMap<String, Size>,
+    pub session_size: HashMap<SessionId, Size>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +245,17 @@ pub struct CreateClientIdResponse {
 #[derive(Deserialize)]
 pub struct TerminalParams {
     pub web_client_id: String,
+    // LOCAL PATCH (web session ownership, llmos#15114): an explicit create
+    // intent on a NAMED terminal socket (`?create=1`). Absent means attach-only;
+    // see `session_creation_policy`. Kept as a string so `1`/`true` both parse
+    // (a bool field would reject `1` with a 400 before this code runs).
+    pub create: Option<String>,
+    // LOCAL PATCH (llmos#16153): the client's own grid, stated on the attach
+    // (`&cols=..&rows=..`), so the first screen is drawn at the client's size and
+    // not at NO_CLAMP_SIZE (2000x500: 1,098,004 bytes in one message, measured
+    // 2026-11-12, which a client with a 1 MiB message limit cannot receive).
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
 }
 
 #[derive(Deserialize)]
